@@ -1,0 +1,136 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>B60-Inkling-web</title>
+<style>
+  :root { --bg:#0b0d10; --panel:#13171c; --line:#232a33; --ink:#e8ecf1; --dim:#8a96a6; --a:#4cc2ff; --b:#ffb454; --ok:#6ee7a0; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; width:100vw; height:100vh; overflow:hidden; background:var(--bg); color:var(--ink);
+              font-family:"Segoe UI",system-ui,sans-serif; }
+  .top { height:64px; padding:0 34px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
+  .top b { font-size:21px; font-weight:600; letter-spacing:.2px; }
+  .top span { color:var(--dim); font-size:16px; }
+  .scene { position:absolute; left:34px; right:34px; top:84px; height:44px; font-size:25px; font-weight:600; }
+  .scene small { color:var(--dim); font-weight:400; font-size:17px; margin-left:14px; }
+  .grid { position:absolute; left:34px; right:34px; top:140px; bottom:30px; display:flex; gap:22px; }
+  .card { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:14px; display:flex; flex-direction:column; overflow:hidden; }
+  .head { padding:16px 22px 12px; display:flex; align-items:flex-end; justify-content:space-between; border-bottom:1px solid var(--line); }
+  .name { font-size:17px; color:var(--dim); text-transform:uppercase; letter-spacing:1.4px; }
+  .name i { font-style:normal; display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:10px; background:var(--c); }
+  .speed { font-variant-numeric:tabular-nums; font-size:54px; font-weight:700; line-height:1; color:var(--c); }
+  .speed u { text-decoration:none; font-size:18px; font-weight:500; color:var(--dim); margin-left:8px; }
+  .text { flex:1; padding:16px 22px; font-size:16.5px; line-height:1.5; color:#cdd5df; white-space:pre-wrap; overflow:hidden;
+          display:block; }
+  .foot { height:38px; padding:0 22px; display:flex; align-items:center; font-size:15px; color:var(--dim); border-top:1px solid var(--line);
+          font-variant-numeric:tabular-nums; }
+  .foot.done { color:var(--ok); }
+  .think { color:#6f7b8b; font-style:italic; display:block; margin-bottom:8px; }
+  .text { overflow-y:hidden; }
+  .fade { transition:opacity .5s; }
+</style></head>
+<body>
+<div class="top"><b>Inkling 2 Mini &nbsp;·&nbsp; one Intel Arc Pro B60 24 GB &nbsp;·&nbsp; Windows 11 &nbsp;·&nbsp; llama.cpp</b><span>live, real time, uncut</span></div>
+<div class="scene" id="scene"></div>
+<div class="grid" id="grid"></div>
+<script>
+const $ = s => document.querySelector(s);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function card(name, color) {
+  const el = document.createElement('div'); el.className = 'card'; el.style.setProperty('--c', color);
+  el.innerHTML = `<div class="head"><div class="name"><i></i>${name}</div><div class="speed"><span>0</span><u>tokens / sec</u></div></div>
+                  <div class="text"><span class="think"></span><div></div></div><div class="foot">waiting</div>`;
+  $('#grid').appendChild(el);
+  return {el, num: el.querySelector('.speed span'), text: el.querySelector('.text div'), think: el.querySelector('.think'), foot: el.querySelector('.foot'),
+          stamps: [], pieces: 0, first: 0, last: 0, done: false, shown: 0};
+}
+
+async function run(c, prompt, maxTokens, priority) {
+  const body = {model: 'x', stream: true, max_tokens: maxTokens, temperature: 0, stream_options: {include_usage: true},
+                chat_template_kwargs: {reasoning_effort: 'none'}, messages: [{role: 'user', content: prompt}]};
+  if (priority) body.priority = priority;
+  c.foot.textContent = 'reading the prompt'; c.sent = performance.now();
+  const r = await fetch('/v1/chat/completions', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '', ct = 0;
+  for (;;) {
+    const {value, done} = await rd.read(); if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line.startsWith('data:') || line.slice(5).trim() === '[DONE]') continue;
+      const j = JSON.parse(line.slice(5));
+      for (const ch of (j.choices || [])) {
+        const d = ch.delta || {};
+        const think = d.reasoning_content || '', piece = d.content || '';
+        if (think || piece) {
+          const now = performance.now(); if (!c.first) c.first = now; c.last = now; c.stamps.push(now); c.pieces++;
+          if (think) { c.think.textContent += think; c.foot.textContent = 'thinking'; }
+          if (piece) { c.text.textContent += piece; c.foot.textContent = 'answering'; }
+          c.text.parentElement.scrollTop = 1e9;
+        }
+      }
+      if (j.usage && j.usage.completion_tokens) ct = j.usage.completion_tokens;
+    }
+  }
+  c.done = true;
+  const secs = (c.last - c.first) / 1000, tps = (ct - 1) / secs;
+  c.final = tps; c.num.textContent = tps.toFixed(1);
+  c.foot.textContent = `done: ${ct} tokens in ${secs.toFixed(1)} s = ${tps.toFixed(1)} tokens/sec  ·  first word after ${((c.first - c.sent) / 1000).toFixed(1)} s`; c.foot.classList.add('done');
+}
+
+// the live number: streamed pieces in the last 2 seconds (a piece is one token or more, so it reads a little low);
+// the number left on screen when a stream ends is the server's own token count over its wall time
+function tick(cards) {
+  const now = performance.now();
+  for (const c of cards) {
+    if (c.done || !c.first) continue;
+    const win = Math.min(2000, now - c.first);
+    const n = c.stamps.filter(t => t > now - win).length;
+    const v = win > 300 ? n / (win / 1000) : 0;
+    c.shown += (v - c.shown) * 0.12;
+    c.num.textContent = c.shown.toFixed(0);
+  }
+}
+
+async function scene(title, sub, defs) {
+  $('#scene').innerHTML = `${title}<small>${sub}</small>`; $('#grid').innerHTML = '';
+  const cards = defs.map(d => card(d.name, d.color));
+  const t = setInterval(() => tick(cards), 50);
+  await Promise.all(defs.map(async (d, i) => { await sleep(d.delay || 0); await run(cards[i], d.prompt, d.max, d.priority); }));
+  clearInterval(t);
+  RESULTS.push(cards.map(c => ({tps: c.final, first: (c.first - c.sent) / 1000})));
+  await sleep(2600);
+}
+
+const RESULTS = [];
+const P_BIKE = 'Explain how a bicycle stays upright while moving, in plain language. About 250 words, no headings, no lists.';
+const P_CODE = 'Write a complete Python module implementing an LRU cache with TTL support, with type hints, docstrings and a small usage example.';
+const P_CALL = 'You are a phone support agent for a small online shop. A customer says their order is nine days late and the tracking page has not changed since Monday. Reply in a calm spoken style, plain sentences, no lists, about 220 words: what you will do, how a refund works and how long it takes.';
+
+const Q_DOC = ['\n\nIn about 150 words and plain sentences, what are the main subjects of the text above?',
+               '\n\nIn about 150 words and plain sentences, describe three people or places that the text above talks about.'];
+const WARM = new URLSearchParams(location.search).get('warm');
+
+(async () => {
+  const docs = await Promise.all([0, 1].map(n => fetch('/doc/' + n).then(r => r.text())));
+  if (WARM) {
+    // load both documents into the cache before the recording: the same prompts, a few tokens out
+    await scene('Loading two 100,000-token documents', 'not part of the recording',
+                [{name: 'chat 1', color: 'var(--a)', prompt: docs[0] + Q_DOC[0], max: 4},
+                 {name: 'chat 2', color: 'var(--b)', prompt: docs[1] + Q_DOC[1], max: 4}]);
+    await fetch('/result', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({warm: true})});
+    document.title = 'B60-Inkling-web-done';
+    return;
+  }
+  await sleep(2500);
+  await scene('Two chats, each holding a 100,000-token document', 'both answering at the same time',
+              [{name: 'chat 1 · 100k tokens of context', color: 'var(--a)', prompt: docs[0] + Q_DOC[0], max: 300},
+               {name: 'chat 2 · 100k tokens of context', color: 'var(--b)', prompt: docs[1] + Q_DOC[1], max: 300}]);
+  await scene('One conversation', '', [{name: 'chat', color: 'var(--a)', prompt: P_BIKE, max: 400}]);
+  await scene('A call comes in while a chat is running', 'the call goes first, the chat waits and picks up after',
+              [{name: 'call · priority', color: 'var(--b)', prompt: P_CALL, max: 320, priority: 4, delay: 4500},
+               {name: 'chat', color: 'var(--a)', prompt: P_CODE, max: 700}]);
+  await fetch('/result', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(RESULTS)});
+  document.title = 'B60-Inkling-web-done';
+})();
+</script>
+</body></html>

@@ -61,6 +61,22 @@ Short contexts, measured 2026-11-22 and not run again on the final build:
 | one of two streams sent with `"priority": 1` | 40.2 tok/s; the other pauses, then runs at 39 |
 | DSpark drafting, one stream | 57 reasoning / 49 code / 33 prose tok/s |
 
+## Demo
+
+[demo/inkling-b60-demo.mp4](demo/inkling-b60-demo.mp4) is a 95-second screen recording of `bench/webdemo/demo.html`,
+real time, one take. The two long documents were loaded into the cache before the recording; everything else happens
+on screen. In that take:
+
+- two chats, each holding a 100K-token document (102K and 104K), answering at the same time: 18.7 tok/s each, first
+  word after 1.3 s
+- one chat on its own: 44.4 tok/s
+- a request sent with `"priority": 4` while a chat is generating: first word after 0.8 s, 35.4 tok/s; the chat waits
+  and averages 24.5 tok/s over its whole run
+
+The grey text is the model's thinking, which it does even at reasoning effort `none`; it is counted in the speed. The
+large number is streamed pieces per second while a stream runs and the server's own token count when it ends. A 218 GB
+download and an upload were running on the machine during the take.
+
 ## Streams and context
 
 There is one cache pool and `-c` is its total size. With `-np 2 --kv-unified` the two streams share it, and either one
