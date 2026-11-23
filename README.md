@@ -61,12 +61,68 @@ Short contexts, measured 2026-11-22 and not run again on the final build:
 | one of two streams sent with `"priority": 1` | 40.2 tok/s; the other pauses, then runs at 39 |
 | DSpark drafting, one stream | 57 reasoning / 49 code / 33 prose tok/s |
 
+## Streams and context
+
+There is one cache pool and `-c` is its total size. With `-np 2 --kv-unified` the two streams share it, and either one
+can take more than half: the pool is not split in two.
+
+| pool (`-c`) | what it holds | memory on the card |
+|---|---|---|
+| 262,144 | 2 x 95K measured | 19.6 GB |
+| 458,752 | the launcher's default | about 21.5 GB (estimated from the two rows around it) |
+| 524,288 | 2 x 237.5K measured (475K live) | 22.6 GB |
+| 1,048,576 | the model's limit | does not fit: 16.4 GiB of model + 9.2 GiB of cache |
+
+The pool is allocated up front, so its size sets the memory, not how much of it is in use. A cached token costs 9.2 KB
+at 4 bits. That is small for a model with 48 layer visits because only 8 of them keep a full-length cache (see below);
+the other 40 look back 1,024 tokens.
+
+Each stream writes into its own region of the pool. A stream's attention reads only its own region, so the second
+stream does not pay for the first one's tokens.
+
+What a stream gets depends on what the other one is doing (95K tokens each):
+
+| the other stream is | this stream decodes at |
+|---|---|
+| idle | 30.7 tok/s |
+| also writing | 19.3 tok/s |
+| reading a long prompt | 15.3 tok/s (the reader gets 256-token turns between this stream's tokens) |
+
+## What the loop does to the cost
+
+The model has 24 layers. Layers 6 to 17 run three times per token, each pass steered by small controllers that read
+what the previous pass produced. So a token makes 48 layer visits with the weights of 24.
+
+What that means when you run it:
+
+- **Every per-visit cost is paid 48 times.** A visit has a loop gate, a mix over earlier block outputs, a
+  relative-position bias, a short convolution and the SITU activation around its matmuls. Stock llama.cpp turned that
+  into about 6,300 GPU dispatches per token, and on this card a dispatch costs 2-3 us whatever it does. One op that
+  fell back to the CPU 194 times per token was the first fix (19 -> 30 tok/s); fusing the small ops (6,300 -> 2,700
+  dispatches) took it to 43.
+- **Decode is limited by how fast the card reads memory.** A token reads about 4.1 GB of weights: 1.3 GiB of attention
+  projections, 1.8 GiB of experts (8 of 128 per visit), 0.5 GiB for the output head, 0.2 GiB of loop controllers. At
+  43 tok/s that is 176 GB/s on a card whose bus does 456. The fastest kernel here runs at 252 GB/s; if everything ran
+  at that rate the ceiling would be about 62 tok/s empty and 48 at 128K. That is an estimate from byte counts, not a
+  measurement.
+- **Long context is cheaper than the layer count suggests.** Only layers 5, 11, 17 and 23 attend to the whole context.
+  11 and 17 are inside the loop, so they run three times: 8 full-context reads per token, 6 of them from the loop. The
+  cost grows by about 0.1 ms per token for every 1,000 tokens of context.
+- **The passes cannot share a cache.** Each pass of layers 11 and 17 writes different keys and values, because the
+  controllers change the inputs. Sharing them or cutting the later passes to a recent window would halve the depth cost
+  and the cache, and it breaks the model (see below).
+- **The pass count is fixed for this model.** Perplexity is 7.69 at 3 passes, 13.6 at 2 and 11.8 at 4.
+
+Where the loop can be used: the separate `TML-d24-varloop-research` model was trained with 1 to 5 passes, and the pass
+count is a setting at load time (`--override-kv inkling2_loop.loop.count=int:N`). One pass decodes at 77 tok/s against
+42 at three. A fast lane for easy requests and a slow one for hard ones would be possible with it, but its tool calls
+fail at any pass count and it refuses more, so it is not a replacement today. The table is further down.
+
 ## What the patches change
 
 Inkling 2 Mini is a looped mixture-of-experts model: 24 physical layers, the middle 12 run three times, so a token makes
-48 layer visits. Each visit adds small ops around the matmuls (a loop gate, attention over earlier block outputs, a
-relative-position bias, a short convolution, the SITU activation). On this card each GPU dispatch costs about 2-3 us and
-stock llama.cpp ran about 6,300 of them per token, plus some ops on the CPU.
+48 layer visits. On this card each GPU dispatch costs about 2-3 us and stock llama.cpp ran about 6,300 of them per
+token, plus some ops on the CPU.
 
 1. **SITU's scale ran on the CPU.** Vulkan `SCALE` only accepted contiguous input, so the scale of the gate/up view
    moved to the CPU twice per visit: 194 graph splits per token. Strided indexing in the scale shader: decode 19.0 ->
