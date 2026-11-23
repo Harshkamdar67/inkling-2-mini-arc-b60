@@ -1,0 +1,1 @@
+{"n_target": 120000, "prompt_tokens": 119570, "seed": 5, "found": 0, "of": 5, "hits": {"Heron@5%": false, "Saffron@25%": false, "Basalt@50%": false, "Juniper@75%": false, "Cobalt@95%": false}, "prompt_tps": 653.8898654125456, "decode_tps": 30.636877256241064, "wall_sec": 202.9, "answer": "", "reasoning_chars": 2038}

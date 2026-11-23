@@ -1,0 +1,29 @@
+B60 is Vulkan0
+=== inkling-p3-n23 02:51:09
+inkling-p3-n23 reasoning think False 15 / 16
+inkling-p3-n23 reasoning think True 16 / 16
+inkling-p3-n23 tool 4/6
+inkling-p3-n23 scores {"reason_think_off": "15/16", "reason_think_on": "16/16", "tool": "4/6", "refused": "0/16", "decode_tps_short": 42.0}
+inkling-p3-n23 cybermetric 300/500
+inkling-p3-n23 vuln 7/14
+inkling-p3-n23 ctf 6/8
+inkling-p3-n23 scores {"cybermetric": "300/500", "vuln_cwe": "7/14", "ctf": "6/8"}
+=== varloop-p1 03:33:51
+varloop-p1 reasoning think False 11 / 16
+varloop-p1 reasoning think True 14 / 16
+varloop-p1 tool 1/6
+varloop-p1 scores {"reason_think_off": "11/16", "reason_think_on": "14/16", "tool": "1/6", "refused": "5/16", "decode_tps_short": 77.1}
+varloop-p1 cybermetric 308/500
+varloop-p1 vuln 3/14
+varloop-p1 ctf 3/8
+varloop-p1 scores {"cybermetric": "308/500", "vuln_cwe": "3/14", "ctf": "3/8"}
+=== varloop-p3 04:03:19
+varloop-p3 reasoning think False 15 / 16
+varloop-p3 reasoning think True 16 / 16
+varloop-p3 tool 1/6
+varloop-p3 scores {"reason_think_off": "15/16", "reason_think_on": "16/16", "tool": "1/6", "refused": "4/16", "decode_tps_short": 41.9}
+varloop-p3 cybermetric 345/500
+varloop-p3 vuln 10/14
+varloop-p3 ctf 5/8
+varloop-p3 scores {"cybermetric": "345/500", "vuln_cwe": "10/14", "ctf": "5/8"}
+=== done 04:44:05

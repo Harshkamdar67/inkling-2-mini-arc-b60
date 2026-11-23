@@ -1,0 +1,164 @@
+From 99b6bdf08fea1308220504b737a916d007a88ffb Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 02:12:16 +0530
+Subject: [PATCH 19/32] vulkan: read the Inkling 2 mask's distances once per
+ group of heads for batches
+
+---
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |  1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 12 +++--
+ .../vulkan-shaders/inkling_rel_mask.comp      | 49 ++++++++++++-------
+ tests/test-backend-ops.cpp                    |  1 +
+ 4 files changed, 43 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index 69d8962ce..ec346f23b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -290,6 +290,7 @@ struct vk_op_inkling_rel_mask_push_constants {
+     uint32_t nbd1;
+     uint32_t nbd2;
+     uint32_t nbd3;
++    uint32_t n_hpg;     // heads per workgroup
+ 
+     uint32_t r_offset;
+     uint32_t b_offset;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 69dad6309..9ee5ff3ea 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8322,15 +8322,21 @@ void ggml_vk_inkling_rel_mask(ggml_backend_vk_context * ctx, vk_context& subctx,
+     const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask,    true);
+     const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,     true);
+ 
++    // for a batch, a workgroup covers as many heads as their bias rows fit in 8192 floats of shared memory, so the distances
++    // and the mask are read once per group of heads instead of once per head (B60, 128K keys: 341 -> 380 tok/s prompt
++    // reading). A few tokens keep one head per workgroup to fill the GPU.
++    const uint32_t n_head = (uint32_t) r->ne[1];
++    const uint32_t n_hpg  = r->ne[2] < 32 ? 1u : std::max(1u, std::min({n_head, 8u, 8192u / (uint32_t) bias->ne[1]}));
++
+     vk_op_inkling_rel_mask_push_constants pc = {
+-        (uint32_t) r->ne[0], (uint32_t) r->ne[1], (uint32_t) bias->ne[1], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
++        (uint32_t) r->ne[0], n_head, (uint32_t) bias->ne[1], (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+         ggml_vk_nb_elem(sinks, 1), ggml_vk_nb_elem(mask, 1), ggml_vk_nb_elem(mask, 3),
+-        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2), ggml_vk_nb_elem(dst, 3),
++        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 2), ggml_vk_nb_elem(dst, 3), n_hpg,
+         0, 0, 0, 0, 0, 0,
+     };
+     init_pushconst_tensor_offsets(ctx, pc, r, bias, sinks, rel_pos, dst);
+ 
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { r_buf, b_buf, s_buf, p_buf, m_buf, d_buf }, pc, { (uint32_t) r->ne[1], (uint32_t) r->ne[2], 1 });
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { r_buf, b_buf, s_buf, p_buf, m_buf, d_buf }, pc, { CEIL_DIV(n_head, n_hpg), (uint32_t) r->ne[2], 1 });
+ }
+ 
+ void ggml_vk_inkling_loop_gate(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/inkling_rel_mask.comp b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_rel_mask.comp
+index cfc0e334a..d61c36e01 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/inkling_rel_mask.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_rel_mask.comp
+@@ -5,8 +5,9 @@
+ #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+ 
+ // Inkling 2 attention mask with the relative-position bias and the per-query sink folded in.
+-// Workgroup (h, tt): build the bias row of head h for token tt over all distances in shared memory,
+-// then write mask + row[rel_pos] - sink for every key, straight to F16.
++// Workgroup (g, tt): build the bias rows of heads g*n_hpg .. g*n_hpg + n_hpg - 1 for token tt over all distances in
++// shared memory, then read each key's distance and mask once and write mask + row[rel_pos] - sink for every head
++// of the group, straight to F16.
+ 
+ layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+ 
+@@ -26,6 +27,7 @@ layout(push_constant) uniform parameter
+     uint nbd1;      // dst strides, elements
+     uint nbd2;
+     uint nbd3;
++    uint n_hpg;
+ 
+     uint r_offset;
+     uint b_offset;
+@@ -42,42 +44,55 @@ layout(binding = 3) readonly  buffer P { int       data_p[]; };
+ layout(binding = 4) readonly  buffer M { float16_t data_m[]; };
+ layout(binding = 5) writeonly buffer D { float16_t data_d[]; };
+ 
+-const uint MAX_EXTENT = 4096;
++const uint MAX_ROWS = 8192;   // n_hpg*n_extent
++const uint MAX_HPG  = 8;
+ 
+-shared float row[MAX_EXTENT];
+-shared float rv[64];
++shared float row[MAX_ROWS];
++shared float rv[MAX_HPG*64];
+ 
+ void main() {
+     const uint tid = gl_LocalInvocationID.x;
+-    const uint h   = gl_WorkGroupID.x;
++    const uint h0  = gl_WorkGroupID.x*n_hpg;
+     const uint tt  = gl_WorkGroupID.y;
+     const uint s   = tt / n_tps;
+     const uint t   = tt % n_tps;
++    const uint nh  = min(n_hpg, n_head - h0);
+ 
+-    const uint r_base = r_offset + n_rel*(h + n_head*tt);
+-    for (uint k = tid; k < n_rel; k += BLOCK_SIZE) {
++    const uint r_base = r_offset + n_rel*(h0 + n_head*tt);
++    for (uint k = tid; k < nh*n_rel; k += BLOCK_SIZE) {
+         rv[k] = data_r[r_base + k];
+     }
+     barrier();
+ 
+-    for (uint d = tid; d < n_extent; d += BLOCK_SIZE) {
++    for (uint i = tid; i < nh*n_extent; i += BLOCK_SIZE) {
++        const uint j = i / n_extent;
++        const uint d = i % n_extent;
+         const uint b_base = b_offset + n_rel*d;
+         float acc = 0.0;
+         for (uint k = 0; k < n_rel; ++k) {
+-            acc += rv[k]*data_b[b_base + k];
++            acc += rv[j*n_rel + k]*data_b[b_base + k];
+         }
+-        row[d] = acc;
++        row[i] = acc;
+     }
+     barrier();
+ 
+-    const float sink = data_s[s_offset + h + nbs1*tt];
+-    const uint  p_row = p_offset + n_kv*tt;
+-    const uint  m_row = m_offset + t*nbm1 + s*nbm3;
+-    const uint  d_row = d_offset + t*nbd1 + h*nbd2 + s*nbd3;
++    float sink[MAX_HPG];
++    [[unroll]] for (uint j = 0; j < MAX_HPG; ++j) {
++        sink[j] = j < nh ? data_s[s_offset + h0 + j + nbs1*tt] : 0.0;
++    }
++    const uint p_row = p_offset + n_kv*tt;
++    const uint m_row = m_offset + t*nbm1 + s*nbm3;
++    const uint d_row = d_offset + t*nbd1 + h0*nbd2 + s*nbd3;
+ 
+     for (uint kv = tid; kv < n_kv; kv += BLOCK_SIZE) {
+         const int   dist = data_p[p_row + kv];
+-        const float b    = (dist >= 0 && uint(dist) < n_extent) ? row[dist] : 0.0;
+-        data_d[d_row + kv] = float16_t(b - sink + float(data_m[m_row + kv]));
++        const bool  near = dist >= 0 && uint(dist) < n_extent;
++        const float m    = float(data_m[m_row + kv]);
++        [[unroll]] for (uint j = 0; j < MAX_HPG; ++j) {
++            if (j < nh) {
++                const float b = near ? row[j*n_extent + uint(dist)] : 0.0;
++                data_d[d_row + j*nbd2 + kv] = float16_t(b - sink[j] + m);
++            }
++        }
+     }
+ }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 91c8563a3..1ead49d97 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11047,6 +11047,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 4096, 7, 1));
+     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 1536, 8, 2));
+     test_cases.emplace_back(new test_inkling_rel_mask(16, 24, 1024, 4096, 512, 1));
++    test_cases.emplace_back(new test_inkling_rel_mask(16, 20, 512, 1536, 6, 2));
+     test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 1, false));
+     test_cases.emplace_back(new test_inkling_loop_gate(64, 8, 3, true));
+     test_cases.emplace_back(new test_inkling_loop_gate(2304, 64, 1, false));
+-- 
+2.52.0.windows.1
+

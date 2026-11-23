@@ -1,0 +1,106 @@
+From 5f1de5e993c20bd5116eec9c54ac3ea4459c2886 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sat, 21 Nov 2026 13:10:17 +0530
+Subject: [PATCH 06/32] vulkan: fill get_rows workgroups for narrow rows,
+ select devices by name
+
+get_rows ran one 512-wide workgroup per row, so 24-float rows left 95% of it idle; x now
+spans (row, column). GGML_VK_DEVICE_NAME keeps only devices whose name contains it, since
+the Windows enumeration order can differ between processes.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 26 +++++++++++++++++--
+ .../ggml-vulkan/vulkan-shaders/get_rows.comp  | 23 ++++++----------
+ 2 files changed, 32 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index d3fe1febd..b72d5c5a7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6128,6 +6128,22 @@ void ggml_vk_instance_init() {
+             return;
+         }
+     }
++
++    // GGML_VK_DEVICE_NAME keeps only the devices whose name contains it: with several GPUs on Windows the
++    // enumeration order, and so every device index, can differ from one process to the next
++    if (const char * name_env = getenv("GGML_VK_DEVICE_NAME")) {
++        std::vector<size_t> kept;
++        for (size_t idx : vk_instance.device_indices) {
++            if (std::string(devices[idx].getProperties().deviceName.data()).find(name_env) != std::string::npos) {
++                kept.push_back(idx);
++            }
++        }
++        if (kept.empty()) {
++            GGML_LOG_WARN("ggml_vulkan: no device name contains GGML_VK_DEVICE_NAME=%s, keeping all\n", name_env);
++        } else {
++            vk_instance.device_indices = kept;
++        }
++    }
+     GGML_LOG_DEBUG("ggml_vulkan: Found %zu Vulkan devices:\n", vk_instance.device_indices.size());
+ 
+     size_t host_buffer_import_count = 0;
+@@ -10605,8 +10621,14 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+ 
+         } break;
+     case GGML_OP_GET_ROWS:
+-        elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
+-        elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
++        if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_I32) {
++            // get_rows.comp spreads (row, column) over x; it loops when x is capped
++            const uint64_t n = (uint64_t) ne00 * ne10;
++            elements = { (uint32_t) std::min<uint64_t>(n, 512ull * ctx->device->properties.limits.maxComputeWorkGroupCount[0]), 1, (uint32_t)(ne11 * ne12) };
++        } else {
++            elements = { (uint32_t)ne00, (uint32_t)ne10, (uint32_t)(ne11 * ne12) };
++            elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
++        }
+         elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+         break;
+     case GGML_OP_GET_ROWS_BACK:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/get_rows.comp b/ggml/src/ggml-vulkan/vulkan-shaders/get_rows.comp
+index e88bdd057..1e2e6379b 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/get_rows.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/get_rows.comp
+@@ -6,19 +6,17 @@
+ layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+ 
+ void main() {
+-    const uint i00 = gl_GlobalInvocationID.x;
+-
+-    if (i00 >= p.ne00) {
+-        return;
+-    }
++    // x runs over (row, column) together, so rows narrower than the workgroup still keep every invocation busy
++    const uint n = p.ne00 * p.ne10;
+ 
+     uint gid_z = gl_GlobalInvocationID.z;
+     while (gid_z < p.ne11 * p.ne12) {
+-        uint gid_y = gl_GlobalInvocationID.y;
+-        while (gid_y < p.ne10) {
+-            const uint i10 = gid_y;
+-            const uint i11 = gid_z / p.ne12;
+-            const uint i12 = gid_z % p.ne12;
++        const uint i11 = gid_z / p.ne12;
++        const uint i12 = gid_z % p.ne12;
++
++        for (uint idx = gl_GlobalInvocationID.x; idx < n; idx += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
++            const uint i10 = idx / p.ne00;
++            const uint i00 = idx - i10 * p.ne00;
+ 
+             const uint i01 = data_b[get_boffset() + i10*p.nb10 + i11*p.nb11 + i12*p.nb12];
+ 
+@@ -30,12 +28,7 @@ void main() {
+ #else
+             TEMP_TYPE v = TEMP_TYPE(data_a[a_offset + i00]);
+ #endif
+-#ifndef OPTIMIZATION_ERROR_WORKAROUND
+             data_d[d_offset + i00] = D_TYPE(v);
+-#else
+-            data_d[d_offset + i00] = D_TYPE(v);
+-#endif
+-            gid_y += gl_WorkGroupSize.y * gl_NumWorkGroups.y;
+         }
+         gid_z += gl_WorkGroupSize.z * gl_NumWorkGroups.z;
+     }
+-- 
+2.52.0.windows.1
+

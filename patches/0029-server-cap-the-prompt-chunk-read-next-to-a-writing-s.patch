@@ -1,0 +1,27 @@
+From 3d286db5b2f868e1337036e26ca11ba4f2432e83 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 22:29:34 +0530
+Subject: [PATCH 29/32] server: cap the prompt chunk read next to a writing
+ slot at 256 tokens
+
+---
+ tools/server/server-context.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c26cb2d79..7e02484f6 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3967,7 +3967,8 @@ private:
+         static int64_t gen_tick = 0;
+         int32_t n_batch_prompt = n_batch;
+         if (gen_share > 0 && !generating.empty()) {
+-            n_batch_prompt = (++gen_tick % (gen_share + 1)) == 0 ? std::min(n_batch, (int32_t) batch.size() + n_ubatch) : 0;
++            // at most 256 prompt tokens in such an iteration, whatever the ubatch: at depth a 1024-token chunk stalls the writer for seconds
++            n_batch_prompt = (++gen_tick % (gen_share + 1)) == 0 ? std::min(n_batch, (int32_t) batch.size() + std::min(n_ubatch, 256)) : 0;
+         }
+ 
+         auto & alora_scale       = batch.alora_scale;
+-- 
+2.52.0.windows.1
+

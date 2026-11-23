@@ -1,0 +1,449 @@
+From 80de70bc5838c4149f3cfd0ffc71f284a836bc71 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 00:08:43 +0530
+Subject: [PATCH 14/32] vulkan: run the Inkling 2 depth attention in two passes
+ over 256-element slices
+
+One workgroup per token left a decode step with one or two workgroups. Pass 0 writes each
+slice's sums of squares and query products to scratch after the result, pass 1 adds them,
+takes the softmax and writes its slice; the CPU reference fills the same scratch. Used for
+single tokens again. B60: decode 37.5 -> 38.8, two-token steps 60.1 -> 63.9, four 86.4 -> 90.3;
+pp512 1212 -> 1185.
+---
+ ggml/include/ggml.h                           |  1 +
+ ggml/src/ggml-cpu/ops.cpp                     | 53 ++++++++----
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |  2 +
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  2 +-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 37 +++++---
+ .../vulkan-shaders/inkling_mix.comp           | 85 ++++++++++---------
+ ggml/src/ggml.c                               |  7 +-
+ src/models/inkling2.cpp                       | 11 +--
+ 8 files changed, 120 insertions(+), 78 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 3b3f17337..ce1d4944f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2508,6 +2508,7 @@ extern "C" {
+     // Inkling 2 attention over the depth: states z = rms_norm(blocks..., cur) (no weight, eps 1e-6),
+     //   result[:, q, t] = sum_i softmax_i(query[:, q] . z_i[:, t] / sqrt(n_embd)) z_i[:, t]
+     // query: [n_embd, n_query], cur and each block: [n_embd, n_tokens] with contiguous rows, n_blocks <= 8
++    // the result is a view: each token column also holds 45 partial sums per 256-element slice
+     GGML_API struct ggml_tensor * ggml_inkling_mix(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * query,
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index f4f7b6f37..fb2658a84 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11571,9 +11571,10 @@ void ggml_compute_forward_inkling_mix(
+     const int n_blocks = ggml_get_op_params_i32(dst, 0);
+     const int n_states = n_blocks + 1;
+ 
+-    const int64_t n_embd   = dst->ne[0];
+-    const int64_t n_query  = dst->ne[1];
+-    const int64_t n_tokens = dst->ne[2];
++    const int64_t n_embd   = query->ne[0];
++    const int64_t n_query  = query->ne[1];
++    const int64_t n_tokens = dst->ne[1];
++    const int64_t n_slices = (n_embd + 255)/256;
+ 
+     // state i: the blocks in order, then cur
+     const ggml_tensor * states[GGML_MAX_SRC];
+@@ -11582,27 +11583,43 @@ void ggml_compute_forward_inkling_mix(
+     }
+     states[n_blocks] = dst->src[1];
+ 
+-    std::vector<float> rinv(n_states), w(n_states);
++    float tot[45];
+ 
+     for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
++        float * col = (float *) ((char *) dst->data + t*dst->nb[1]);
++        float * scr = col + n_embd*n_query;
++
+         const float * s[GGML_MAX_SRC];
+         for (int i = 0; i < n_states; ++i) {
+             s[i] = (const float *) ((const char *) states[i]->data + t*states[i]->nb[1]);
+-            ggml_float ss = 0.0;
+-            for (int64_t e = 0; e < n_embd; ++e) {
+-                ss += (ggml_float) s[i][e]*s[i][e];
++        }
++
++        // k = i: sum of squares of state i; k = 9*(1 + q) + i: query q . state i; per slice of 256 elements
++        for (int k = 0; k < 45; ++k) {
++            tot[k] = 0.0f;
++        }
++        for (int64_t c = 0; c < n_slices; ++c) {
++            float part[45] = {};
++            for (int64_t e = c*256; e < std::min<int64_t>(n_embd, (c + 1)*256); ++e) {
++                for (int i = 0; i < n_states; ++i) {
++                    const float x = s[i][e];
++                    part[i] += x*x;
++                    for (int64_t q = 0; q < n_query; ++q) {
++                        part[9*(1 + q) + i] += ((const float *) ((const char *) query->data + q*query->nb[1]))[e]*x;
++                    }
++                }
++            }
++            for (int k = 0; k < 45; ++k) {
++                scr[c*45 + k] = part[k];
++                tot[k] += part[k];
+             }
+-            rinv[i] = 1.0f/sqrtf((float) (ss/n_embd) + 1e-6f);
+         }
++
++        float w[9];
+         for (int64_t q = 0; q < n_query; ++q) {
+-            const float * qv = (const float *) ((const char *) query->data + q*query->nb[1]);
+             float mx = -INFINITY;
+             for (int i = 0; i < n_states; ++i) {
+-                float dot = 0.0f;
+-                for (int64_t e = 0; e < n_embd; ++e) {
+-                    dot += qv[e]*s[i][e];
+-                }
+-                w[i] = dot*rinv[i]/sqrtf((float) n_embd);
++                w[i] = tot[9*(1 + q) + i]/sqrtf(tot[i]/n_embd + 1e-6f)/sqrtf((float) n_embd);
+                 mx = std::max(mx, w[i]);
+             }
+             float sum = 0.0f;
+@@ -11610,13 +11627,15 @@ void ggml_compute_forward_inkling_mix(
+                 w[i] = expf(w[i] - mx);
+                 sum += w[i];
+             }
+-            float * o = (float *) ((char *) dst->data + q*dst->nb[1] + t*dst->nb[2]);
++            for (int i = 0; i < n_states; ++i) {
++                w[i] = w[i]/sum/sqrtf(tot[i]/n_embd + 1e-6f);
++            }
+             for (int64_t e = 0; e < n_embd; ++e) {
+                 float acc = 0.0f;
+                 for (int i = 0; i < n_states; ++i) {
+-                    acc += w[i]*rinv[i]*s[i][e];
++                    acc += w[i]*s[i][e];
+                 }
+-                o[e] = acc/sum;
++                col[q*n_embd + e] = acc;
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index 07d75c99b..6a015776a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -241,6 +241,8 @@ struct vk_op_inkling_mix_push_constants {
+     uint32_t nbd2;
+     uint32_t q_offset;
+     uint32_t d_offset;
++    uint32_t scr_offset;
++    uint32_t n_slices;
+     uint32_t nbs1[9];
+     uint32_t s_offset[9];
+ };
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 300707841..060e10e3d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -993,7 +993,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_dsv4_hc_post_f32;
+     vk_pipeline pipeline_inkling_loop_gate_f32[2];
+     vk_pipeline pipeline_inkling_rel_mask_f16;
+-    vk_pipeline pipeline_inkling_mix_f32;
++    vk_pipeline pipeline_inkling_mix_f32[2];
+     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+     vk_pipeline pipeline_top_k_mask_f16;
+     vk_pipeline pipeline_top_k_mask_f32;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index daffa86d3..25ce14835 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4092,7 +4092,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+-    ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32, "inkling_mix_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {1, 1, 1}, { 256 }, 1, false, true);
++    ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[0], "inkling_mix_a_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 0 }, 1, false, true);
++    ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[1], "inkling_mix_b_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 1 }, 1, false, true);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_rel_mask_f16, "inkling_rel_mask_f16", inkling_rel_mask_f16_len, inkling_rel_mask_f16_data, "main", 6, sizeof(vk_op_inkling_rel_mask_push_constants), {1, 1, 1}, { 256 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_loop_gate_f32[0], "inkling_loop_gate_a_f32", inkling_loop_gate_f32_len, inkling_loop_gate_f32_data, "main", 6, sizeof(vk_op_inkling_loop_gate_push_constants), {1, 1, 1}, { 256, 0 }, 1, false, true);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_loop_gate_f32[1], "inkling_loop_gate_b_f32", inkling_loop_gate_f32_len, inkling_loop_gate_f32_data, "main", 6, sizeof(vk_op_inkling_loop_gate_push_constants), {256, 1, 1}, { 256, 1 }, 1, false, true);
+@@ -8207,18 +8208,26 @@ void ggml_vk_inkling_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml
+     const ggml_tensor * cur   = dst->src[1];
+     const int n_blocks = ggml_get_op_params_i32(dst, 0);
+ 
+-    vk_pipeline pipeline = ctx->device->pipeline_inkling_mix_f32;
+-    GGML_ASSERT(pipeline != nullptr);
++    vk_pipeline pipeline_a = ctx->device->pipeline_inkling_mix_f32[0];
++    vk_pipeline pipeline_b = ctx->device->pipeline_inkling_mix_f32[1];
++    GGML_ASSERT(pipeline_a != nullptr && pipeline_b != nullptr);
+ 
+-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline_a, 1);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline_b, 1);
++
++    // dst is the op node: per token column, n_embd*n_query results then n_slices*45 partial sums
++    const uint32_t n_embd  = (uint32_t) cur->ne[0];
++    const uint32_t n_query = (uint32_t) query->ne[1];
+ 
+     vk_op_inkling_mix_push_constants pc = {};
+-    pc.n_embd   = (uint32_t) cur->ne[0];
+-    pc.n_query  = (uint32_t) query->ne[1];
+-    pc.n_states = (uint32_t) n_blocks + 1;
+-    pc.nbq1     = ggml_vk_nb_elem(query, 1);
+-    pc.nbd1     = ggml_vk_nb_elem(dst, 1);
+-    pc.nbd2     = ggml_vk_nb_elem(dst, 2);
++    pc.n_embd     = n_embd;
++    pc.n_query    = n_query;
++    pc.n_states   = (uint32_t) n_blocks + 1;
++    pc.nbq1       = ggml_vk_nb_elem(query, 1);
++    pc.nbd1       = n_embd;
++    pc.nbd2       = ggml_vk_nb_elem(dst, 1);
++    pc.scr_offset = n_embd*n_query;
++    pc.n_slices   = (n_embd + 255)/256;
+     pc.q_offset = get_misalign_bytes(ctx, query) / sizeof(float);
+     pc.d_offset = get_misalign_bytes(ctx, dst) / sizeof(float);
+ 
+@@ -8238,9 +8247,13 @@ void ggml_vk_inkling_mix(ggml_backend_vk_context * ctx, vk_context& subctx, ggml
+     pc.s_offset[n_blocks] = get_misalign_bytes(ctx, cur) / sizeof(float);
+     bufs.push_back(ggml_vk_tensor_subbuffer(ctx, dst, true));
+ 
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_a,
++        { bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10] },
++        pc, { n_embd, (uint32_t) cur->ne[1], 1 });
++    ggml_vk_sync_buffers(ctx, subctx);
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_b,
+         { bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10] },
+-        pc, { (uint32_t) cur->ne[1], 1, 1 });
++        pc, { n_embd, (uint32_t) cur->ne[1], 1 });
+ }
+ 
+ void ggml_vk_inkling_rel_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/inkling_mix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_mix.comp
+index 6c08510bd..dac52fd2b 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/inkling_mix.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_mix.comp
+@@ -4,28 +4,34 @@
+ #extension GL_KHR_shader_subgroup_basic : require
+ #extension GL_KHR_shader_subgroup_arithmetic : require
+ 
+-// Inkling 2 attention over the depth, one workgroup per token:
++// Inkling 2 attention over the depth, in two passes over slices of BLOCK_SIZE elements:
+ //   z_i = rms_norm(state_i), w[q, i] = softmax_i(query_q . z_i / sqrt(n_embd)), out_q = sum_i w[q, i] z_i
+-// states: the blocks (bindings 2..9) then cur (binding 1).
++//   pass 0, workgroup (slice, t): the slice's sums of squares and query dot products into scratch
++//   pass 1, workgroup (slice, t): add the slices up, softmax, write the slice of every output
++// states: the blocks (bindings 2..9) then cur (binding 1). The scratch of token t starts at d_offset + scr_offset + t*nbd2.
+ 
+ layout(constant_id = 0) const uint BLOCK_SIZE = 256;
++layout(constant_id = 1) const uint PASS = 0;
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ const uint MAX_STATES = 9;
+ const uint MAX_QUERY  = 4;
++const uint N_ACC      = MAX_STATES*(1 + MAX_QUERY);
+ 
+ layout(push_constant) uniform parameter
+ {
+     uint n_embd;
+     uint n_query;
+     uint n_states;
+-    uint nbq1;     // query column stride, elements
+-    uint nbd1;     // dst strides, elements
++    uint nbq1;        // query column stride, elements
++    uint nbd1;        // dst strides, elements
+     uint nbd2;
+     uint q_offset;
+     uint d_offset;
+-    uint nbs1[MAX_STATES];      // row stride of each state, elements
++    uint scr_offset;  // scratch, elements from the start of a token's column
++    uint n_slices;
++    uint nbs1[MAX_STATES];
+     uint s_offset[MAX_STATES];
+ };
+ 
+@@ -39,9 +45,8 @@ layout(binding = 6)  readonly buffer S5 { float data_s5[]; };
+ layout(binding = 7)  readonly buffer S6 { float data_s6[]; };
+ layout(binding = 8)  readonly buffer S7 { float data_s7[]; };
+ layout(binding = 9)  readonly buffer S8 { float data_s8[]; };
+-layout(binding = 10) writeonly buffer D { float data_d[]; };
++layout(binding = 10)          buffer D  { float data_d[]; };
+ 
+-// state i in host order: blocks 0..n_states-2 are bindings 2.., cur (the last state) is binding 1
+ float load_state(uint i, uint t, uint e) {
+     const uint idx = s_offset[i] + t*nbs1[i] + e;
+     if (i == n_states - 1) return data_s0[idx];
+@@ -57,47 +62,51 @@ float load_state(uint i, uint t, uint e) {
+     }
+ }
+ 
+-const uint N_ACC = MAX_STATES*(1 + MAX_QUERY);
+-
+ shared float red[N_ACC][32];
+ shared float tot[N_ACC];
+ shared float wgt[MAX_QUERY][MAX_STATES];
+ 
+ void main() {
+-    const uint tid = gl_LocalInvocationID.x;
+-    const uint t   = gl_WorkGroupID.x;
++    const uint tid   = gl_LocalInvocationID.x;
++    const uint slice = gl_WorkGroupID.x;
++    const uint t     = gl_WorkGroupID.y;
++    const uint e     = slice*BLOCK_SIZE + tid;
++    const uint scr   = d_offset + t*nbd2 + scr_offset;
+ 
+-    // acc[i] = sum of squares of state i, acc[n_states*(1 + q) + i] = query_q . state_i
+-    float acc[N_ACC];
+-    [[unroll]] for (uint k = 0; k < N_ACC; ++k) {
+-        acc[k] = 0.0;
++    float x[MAX_STATES];
++    [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
++        x[i] = (i < n_states && e < n_embd) ? load_state(i, t, e) : 0.0;
+     }
+-    for (uint e = tid; e < n_embd; e += BLOCK_SIZE) {
++
++    if (PASS == 0) {
+         float qv[MAX_QUERY];
+         [[unroll]] for (uint q = 0; q < MAX_QUERY; ++q) {
+-            qv[q] = q < n_query ? data_q[q_offset + q*nbq1 + e] : 0.0;
++            qv[q] = (q < n_query && e < n_embd) ? data_q[q_offset + q*nbq1 + e] : 0.0;
+         }
+-        [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
+-            if (i < n_states) {
+-                const float x = load_state(i, t, e);
+-                acc[i] += x*x;
+-                [[unroll]] for (uint q = 0; q < MAX_QUERY; ++q) {
+-                    acc[MAX_STATES*(1 + q) + i] += qv[q]*x;
+-                }
++        // k = i: sum of squares of state i; k = MAX_STATES*(1 + q) + i: query_q . state_i
++        [[unroll]] for (uint k = 0; k < N_ACC; ++k) {
++            const uint i = k % MAX_STATES;
++            const uint q = k / MAX_STATES;
++            const float v = subgroupAdd(q == 0 ? x[i]*x[i] : qv[q - 1]*x[i]);
++            if (subgroupElect()) {
++                red[k][gl_SubgroupID] = v;
+             }
+         }
+-    }
+-    [[unroll]] for (uint k = 0; k < N_ACC; ++k) {
+-        const float v = subgroupAdd(acc[k]);
+-        if (subgroupElect()) {
+-            red[k][gl_SubgroupID] = v;
++        barrier();
++        if (tid < N_ACC) {
++            float s = 0.0;
++            for (uint g = 0; g < gl_NumSubgroups; ++g) {
++                s += red[tid][g];
++            }
++            data_d[scr + slice*N_ACC + tid] = s;
+         }
++        return;
+     }
+-    barrier();
++
+     if (tid < N_ACC) {
+         float s = 0.0;
+-        for (uint g = 0; g < gl_NumSubgroups; ++g) {
+-            s += red[tid][g];
++        for (uint c = 0; c < n_slices; ++c) {
++            s += data_d[scr + c*N_ACC + tid];
+         }
+         tot[tid] = s;
+     }
+@@ -106,12 +115,11 @@ void main() {
+     if (tid < n_query) {
+         const uint q = tid;
+         const float scale = inversesqrt(float(n_embd));
+-        float mx = -1.0/0.0;
+         float sc[MAX_STATES];
++        float mx = -1.0/0.0;
+         [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
+             if (i < n_states) {
+-                const float rinv = inversesqrt(tot[i]/float(n_embd) + 1e-6);
+-                sc[i] = tot[MAX_STATES*(1 + q) + i]*rinv*scale;
++                sc[i] = tot[MAX_STATES*(1 + q) + i]*inversesqrt(tot[i]/float(n_embd) + 1e-6)*scale;
+                 mx = max(mx, sc[i]);
+             }
+         }
+@@ -124,18 +132,13 @@ void main() {
+         }
+         [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
+             if (i < n_states) {
+-                // fold the state's norm into its weight
+                 wgt[q][i] = sc[i]/sum*inversesqrt(tot[i]/float(n_embd) + 1e-6);
+             }
+         }
+     }
+     barrier();
+ 
+-    for (uint e = tid; e < n_embd; e += BLOCK_SIZE) {
+-        float x[MAX_STATES];
+-        [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
+-            x[i] = i < n_states ? load_state(i, t, e) : 0.0;
+-        }
++    if (e < n_embd) {
+         for (uint q = 0; q < n_query; ++q) {
+             float o = 0.0;
+             [[unroll]] for (uint i = 0; i < MAX_STATES; ++i) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index a8acd6972..f596e8669 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6549,7 +6549,10 @@ struct ggml_tensor * ggml_inkling_mix(
+         GGML_ASSERT(blocks[i]->ne[0] == n_embd && blocks[i]->ne[1] == cur->ne[1] && blocks[i]->nb[0] == sizeof(float));
+     }
+ 
+-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, query->ne[1], cur->ne[1]);
++    // each token column: the result, then 45 partial sums (9 states x (1 + 4 queries)) per slice of 256 elements
++    const int64_t n_slices = (n_embd + 255)/256;
++    const int64_t n_col    = n_embd*query->ne[1] + n_slices*45;
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_col, cur->ne[1]);
+ 
+     ggml_set_op_params_i32(result, 0, n_blocks);
+ 
+@@ -6560,7 +6563,7 @@ struct ggml_tensor * ggml_inkling_mix(
+         result->src[2 + i] = blocks[i];
+     }
+ 
+-    return result;
++    return ggml_view_3d(ctx, result, n_embd, query->ne[1], cur->ne[1], n_embd*sizeof(float), result->nb[1], 0);
+ }
+ 
+ // ggml_inkling_rel_mask
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 37e46a236..cdc808929 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -193,9 +193,8 @@ ggml_tensor * llama_model_inkling2::graph::stack(const std::vector<ggml_tensor *
+ // the softmax is over the set of states, so their order does not matter
+ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+     static const bool no_fuse = getenv("LLAMA_INKLING_NO_FUSE") != nullptr;
+-    if (!no_fuse && n_tokens > 1 && blocks.size() <= 8 && query->ne[1] <= 4) {
+-        // norms, scores, softmax and the weighted sum in one op, one workgroup per token; with a single token the
+-        // separate ops spread over more of the GPU and are faster (B60: 37.4 vs 36.5 tok/s)
++    if (!no_fuse && blocks.size() <= 8 && query->ne[1] <= 4) {
++        // norms, scores, softmax and the weighted sum in one op
+         ggml_tensor * b[8];
+         for (size_t i = 0; i < blocks.size(); ++i) {
+             b[i] = ggml_reshape_2d(ctx0, blocks[i], n_embd, n_tokens);
+@@ -474,7 +473,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     cb(ffn_inp, "ffn_inp", il);
+ 
+     // MoE
+-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
++    cur = mix(blocks, cur, layer.ffn_res_query);
++    cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0); // one query; the fused result is strided
+     if (messages) {
+         cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+     }
+@@ -508,7 +508,8 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ }
+ 
+ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
++    cur = mix(blocks, cur, model.output_res_query);
++    cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0); // one query; the fused result is strided
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+     res->t_layer_inp[n_layer] = cur;
+ 
+-- 
+2.52.0.windows.1
+

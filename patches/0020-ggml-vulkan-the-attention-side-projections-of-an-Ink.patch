@@ -1,0 +1,622 @@
+From 0d53946e2f1be2cd988058fa467087d52aaf506f Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 15:01:20 +0530
+Subject: [PATCH 20/32] ggml, vulkan: the attention-side projections of an
+ Inkling 2 layer visit as one op for a single token
+
+---
+ ggml/include/ggml.h                           |  13 ++
+ ggml/src/ggml-cpu/ggml-cpu.c                  |   5 +
+ ggml/src/ggml-cpu/ops.cpp                     |  38 +++++
+ ggml/src/ggml-cpu/ops.h                       |   1 +
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |  11 ++
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |   1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  56 ++++++++
+ .../vulkan-shaders/inkling_proj.comp          | 131 ++++++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   1 +
+ ggml/src/ggml.c                               |  50 ++++++-
+ src/models/inkling2.cpp                       |  36 ++++-
+ tests/test-backend-ops.cpp                    |  41 ++++++
+ 12 files changed, 376 insertions(+), 8 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/inkling_proj.comp
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 6e030bab8..71ac840c1 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -420,6 +420,7 @@ extern "C" {
+         GGML_OP_INKLING_MIX,
+         GGML_OP_INKLING_SITU,
+         GGML_OP_INKLING_CONV,
++        GGML_OP_INKLING_PROJ,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2520,6 +2521,18 @@ extern "C" {
+             struct ggml_tensor  * weight,
+             float                 scale);
+ 
++    // Inkling 2: several matrices times a few input vectors as one op, for the projections of a layer visit that
++    // read the same inputs. inputs: n_inputs <= 3 tensors [n_embd, n_tokens] with contiguous rows; weights:
++    // n_weights <= 7 matrices [n_embd, n_rows_i]; weight i multiplies inputs[input_of[i]].
++    // Result: [sum_i n_rows_i, n_tokens], the products one after another.
++    GGML_API struct ggml_tensor * ggml_inkling_proj(
++            struct ggml_context * ctx,
++            struct ggml_tensor ** inputs,
++            int                   n_inputs,
++            struct ggml_tensor ** weights,
++            const int           * input_of,
++            int                   n_weights);
++
+     // Inkling 2 SITU activation of a fused gate/up tensor a = [gate (n_ff); up (n_ff)] per row:
+     //   result = k * tanh(gate/beta)*sigmoid(gate) * (lb > 0 ? tanh(up/lb) : up),  k = scale
+     // a: [2*n_ff, ...] with contiguous rows; result: [n_ff, ...] contiguous
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 237005cd2..eba6ee03c 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2137,6 +2137,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_inkling_conv(params, tensor);
+             } break;
++        case GGML_OP_INKLING_PROJ:
++            {
++                ggml_compute_forward_inkling_proj(params, tensor);
++            } break;
+         case GGML_OP_TOP_K_MASK:
+             {
+                 ggml_compute_forward_top_k_mask(params, tensor);
+@@ -2329,6 +2333,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_INKLING_MIX:
+         case GGML_OP_INKLING_SITU:
+         case GGML_OP_INKLING_CONV:
++        case GGML_OP_INKLING_PROJ:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 8adf49334..03e7b0490 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11562,6 +11562,44 @@ void ggml_compute_forward_dsv4_hc_pre(
+     }
+ }
+ 
++// ggml_compute_forward_inkling_proj
++
++void ggml_compute_forward_inkling_proj(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const int n_w = ggml_get_op_params_i32(dst, 0);
++
++    const int64_t n_embd   = dst->src[0]->ne[0];
++    const int64_t n_tokens = dst->ne[1];
++
++    std::vector<float> row(n_embd);
++
++    int64_t base = 0;
++    for (int w = 0; w < n_w; ++w) {
++        const ggml_tensor * W = dst->src[3 + w];
++        const ggml_tensor * x = dst->src[ggml_get_op_params_i32(dst, 1 + w)];
++
++        const int64_t n_rows   = W->ne[1];
++        const size_t  row_size = ggml_row_size(W->type, n_embd);
++        const auto    to_float = ggml_get_type_traits(W->type)->to_float;
++
++        for (int64_t r = params->ith; r < n_rows; r += params->nth) {
++            const void  * p  = (const char *) W->data + r*row_size;
++            const float * wr = (const float *) p;
++            if (W->type != GGML_TYPE_F32) {
++                to_float(p, row.data(), n_embd);
++                wr = row.data();
++            }
++            for (int64_t t = 0; t < n_tokens; ++t) {
++                float s = 0.0f;
++                ggml_vec_dot_f32(n_embd, &s, 0, wr, 0, (const float *) ((const char *) x->data + t*x->nb[1]), 0, 1);
++                ((float *) ((char *) dst->data + t*dst->nb[1]))[base + r] = s;
++            }
++        }
++        base += n_rows;
++    }
++}
++
+ // ggml_compute_forward_inkling_conv
+ 
+ void ggml_compute_forward_inkling_conv(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 4f28b1de6..a6f7a4ab9 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -112,6 +112,7 @@ void ggml_compute_forward_inkling_rel_mask(const struct ggml_compute_params * pa
+ void ggml_compute_forward_inkling_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_inkling_situ(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_inkling_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_inkling_proj(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_top_k_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index ec346f23b..e18d840e2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -232,6 +232,17 @@ struct vk_op_dsv4_hc_pre_push_constants {
+     float scale;
+ };
+ 
++struct vk_op_inkling_proj_push_constants {
++    uint32_t n_embd;
++    uint32_t n_w;
++    uint32_t nbd1;
++    uint32_t d_offset;
++    uint32_t x_offset[3];
++    uint32_t nbx1[3];
++    uint32_t row_end[7];
++    uint32_t input_of[7];
++};
++
+ struct vk_op_inkling_conv_push_constants {
+     uint32_t n_ch;
+     uint32_t n_tokens;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index c57526beb..6c94b1163 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -996,6 +996,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_inkling_mix_f32[2];
+     vk_pipeline pipeline_inkling_situ_f32;
+     vk_pipeline pipeline_inkling_conv_f32;
++    vk_pipeline pipeline_inkling_proj_q8_0;
+     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+     vk_pipeline pipeline_top_k_mask_f16;
+     vk_pipeline pipeline_top_k_mask_f32;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 9ee5ff3ea..2e6a6d1c5 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4093,6 +4093,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_conv_f32, "inkling_conv_f32", inkling_conv_f32_len, inkling_conv_f32_data, "main", 4, sizeof(vk_op_inkling_conv_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_inkling_proj_q8_0, "inkling_proj_q8_0", inkling_proj_q8_0_len, inkling_proj_q8_0_data, "main", 11, sizeof(vk_op_inkling_proj_push_constants), {4, 1, 1}, { 32 }, 1, false, true);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_situ_f32, "inkling_situ_f32", inkling_situ_f32_len, inkling_situ_f32_data, "main", 2, sizeof(vk_op_inkling_situ_push_constants), {256, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[0], "inkling_mix_a_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 0 }, 1, false, true);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[1], "inkling_mix_b_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 1 }, 1, false, true);
+@@ -8205,6 +8206,46 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+ }
+ 
++void ggml_vk_inkling_proj(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const int n_w = ggml_get_op_params_i32(dst, 0);
++
++    vk_pipeline pipeline = ctx->device->pipeline_inkling_proj_q8_0;
++    GGML_ASSERT(pipeline != nullptr);
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    vk_op_inkling_proj_push_constants pc = {};
++    pc.n_embd   = (uint32_t) dst->src[0]->ne[0];
++    pc.n_w      = (uint32_t) n_w;
++    pc.nbd1     = ggml_vk_nb_elem(dst, 1);
++    pc.d_offset = (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(float));
++
++    vk_subbuffer bufs[11];
++    for (int i = 0; i < 3; ++i) {
++        const ggml_tensor * x = dst->src[i];
++        bufs[i]        = ggml_vk_tensor_subbuffer(ctx, x, true);
++        pc.x_offset[i] = (uint32_t) (get_misalign_bytes(ctx, x) / sizeof(float));
++        pc.nbx1[i]     = ggml_vk_nb_elem(x, 1);
++    }
++
++    // unused weight bindings repeat the last matrix
++    uint32_t n_rows = 0;
++    for (int i = 0; i < 7; ++i) {
++        const ggml_tensor * W = dst->src[3 + std::min(i, n_w - 1)];
++        bufs[3 + i] = ggml_vk_tensor_subbuffer(ctx, W);
++        if (i < n_w) {
++            n_rows += (uint32_t) W->ne[1];
++            pc.input_of[i] = (uint32_t) ggml_get_op_params_i32(dst, 1 + i);
++        }
++        pc.row_end[i] = n_rows;
++    }
++    bufs[10] = ggml_vk_tensor_subbuffer(ctx, dst, true);
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        { bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], bufs[6], bufs[7], bufs[8], bufs[9], bufs[10] },
++        pc, { n_rows, (uint32_t) dst->ne[1], 1 });
++}
++
+ void ggml_vk_inkling_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const ggml_tensor * cur    = dst->src[0];
+     const ggml_tensor * past   = dst->src[1];
+@@ -14053,6 +14094,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+     case GGML_OP_INKLING_CONV:
+         ggml_vk_inkling_conv(ctx, compute_ctx, node);
+ 
++        break;
++    case GGML_OP_INKLING_PROJ:
++        ggml_vk_inkling_proj(ctx, compute_ctx, node);
++
+         break;
+     case GGML_OP_MEAN:
+         ggml_vk_mean(ctx, compute_ctx, src0, node);
+@@ -17337,6 +17382,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             return op->src[0]->nb[0] == sizeof(float);
+         case GGML_OP_INKLING_CONV:
+             return op->src[1]->ne[1] <= 65535*256 && op->src[0]->ne[1] <= 65535;
++        case GGML_OP_INKLING_PROJ:
++            // Q8_0 matrices only, four rows per workgroup, whole blocks per thread
++            if (!device->subgroup_arithmetic || !device->subgroup_require_full_support || op->src[0]->ne[0] % 32 != 0) {
++                return false;
++            }
++            for (int i = 0; i < ggml_get_op_params_i32(op, 0); ++i) {
++                if (op->src[3 + i]->type != GGML_TYPE_Q8_0 || op->src[3 + i]->ne[1] % 4 != 0) {
++                    return false;
++                }
++            }
++            return true;
+         case GGML_OP_INKLING_MIX:
+             // up to 8 blocks and 4 queries, as the shader unrolls them
+             return device->subgroup_arithmetic && device->subgroup_require_full_support &&
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/inkling_proj.comp b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_proj.comp
+new file mode 100644
+index 000000000..56ce143cd
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_proj.comp
+@@ -0,0 +1,131 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : require
++#extension GL_EXT_shader_16bit_storage : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++
++// Inkling 2: up to 7 Q8_0 matrices times up to 3 input vectors in one dispatch, the outputs one after another.
++// A layer visit has six such products on the attention side; as separate mat-vecs of 0.05 to 7 MB each they
++// run at about half the memory bandwidth of the card and pay a launch each.
++// Workgroup (rows / NUM_ROWS, token): NUM_ROWS rows of the matrix those rows fall in; thread tid takes blocks tid, tid + BLOCK_SIZE, ..
++
++layout(constant_id = 0) const uint BLOCK_SIZE = 32;
++
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++const uint MAX_W    = 7;
++const uint NUM_ROWS = 4;
++
++layout(push_constant) uniform parameter
++{
++    uint n_embd;
++    uint n_w;
++    uint nbd1;            // dst token stride, elements
++    uint d_offset;
++    uint x_offset[3];
++    uint nbx1[3];         // input token strides, elements
++    uint row_end[MAX_W];  // one past the last output row of each matrix
++    uint input_of[MAX_W];
++};
++
++struct block_q8 {
++    float16_t d;
++    int16_t   qs[16];
++};
++
++layout(binding = 0)  readonly  buffer X0 { float data_x0[]; };
++layout(binding = 1)  readonly  buffer X1 { float data_x1[]; };
++layout(binding = 2)  readonly  buffer X2 { float data_x2[]; };
++layout(binding = 3)  readonly  buffer W0 { block_q8 data_w0[]; };
++layout(binding = 4)  readonly  buffer W1 { block_q8 data_w1[]; };
++layout(binding = 5)  readonly  buffer W2 { block_q8 data_w2[]; };
++layout(binding = 6)  readonly  buffer W3 { block_q8 data_w3[]; };
++layout(binding = 7)  readonly  buffer W4 { block_q8 data_w4[]; };
++layout(binding = 8)  readonly  buffer W5 { block_q8 data_w5[]; };
++layout(binding = 9)  readonly  buffer W6 { block_q8 data_w6[]; };
++layout(binding = 10) writeonly buffer D  { float data_d[]; };
++
++shared float red[NUM_ROWS][32];
++
++#define LOAD_B(X) \
++    [[unroll]] for (uint k = 0; k < 32; ++k) { \
++        b[k] = X[xb + blk*32 + k]; \
++    }
++
++// two weights per 16-bit load: the low byte, then the high byte
++#define ROWS(W) \
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { \
++        const uint ib = (r + n)*nb + blk; \
++        float s = 0.0; \
++        [[unroll]] for (uint k = 0; k < 16; ++k) { \
++            const int q = int(W[ib].qs[k]); \
++            s += float((q << 24) >> 24)*b[2*k] + float(q >> 8)*b[2*k + 1]; \
++        } \
++        acc[n] += float(W[ib].d)*s; \
++    }
++
++void main() {
++    const uint tid  = gl_LocalInvocationID.x;
++    const uint row0 = gl_WorkGroupID.x*NUM_ROWS;
++    const uint t    = gl_WorkGroupID.y;
++
++    if (row0 >= row_end[n_w - 1]) {
++        return;
++    }
++
++    uint m     = 0;
++    uint start = 0;
++    [[unroll]] for (uint i = 0; i + 1 < MAX_W; ++i) {
++        if (i + 1 < n_w && row0 >= row_end[i]) {
++            m     = i + 1;
++            start = row_end[i];
++        }
++    }
++
++    const uint r  = row0 - start;
++    const uint nb = n_embd/32;
++    const uint xi = input_of[m];
++    const uint xb = x_offset[xi] + t*nbx1[xi];
++
++    float acc[NUM_ROWS];
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++        acc[n] = 0.0;
++    }
++
++    for (uint blk = tid; blk < nb; blk += BLOCK_SIZE) {
++        float b[32];
++        switch (xi) {
++            case 0:  LOAD_B(data_x0) break;
++            case 1:  LOAD_B(data_x1) break;
++            default: LOAD_B(data_x2) break;
++        }
++        switch (m) {
++            case 0:  ROWS(data_w0) break;
++            case 1:  ROWS(data_w1) break;
++            case 2:  ROWS(data_w2) break;
++            case 3:  ROWS(data_w3) break;
++            case 4:  ROWS(data_w4) break;
++            case 5:  ROWS(data_w5) break;
++            default: ROWS(data_w6) break;
++        }
++    }
++
++    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
++        const float v = subgroupAdd(acc[n]);
++        if (subgroupElect()) {
++            red[n][gl_SubgroupID] = v;
++        }
++    }
++    barrier();
++
++    if (tid < NUM_ROWS) {
++        float s = 0.0;
++        for (uint g = 0; g < gl_NumSubgroups; ++g) {
++            s += red[tid][g];
++        }
++        data_d[d_offset + t*nbd1 + row0 + tid] = s;
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 918818680..2ae10aaee 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1091,6 +1091,7 @@ void process_shaders() {
+     string_to_spv("inkling_mix_f32", "inkling_mix.comp", {});
+     string_to_spv("inkling_situ_f32", "inkling_situ.comp", {});
+     string_to_spv("inkling_conv_f32", "inkling_conv.comp", {});
++    string_to_spv("inkling_proj_q8_0", "inkling_proj.comp", {});
+     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
+     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 916686611..1568d5141 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1104,6 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "INKLING_MIX",
+     "INKLING_SITU",
+     "INKLING_CONV",
++    "INKLING_PROJ",
+ 
+     "UNARY",
+ 
+@@ -1123,7 +1124,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "SLEEP",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1224,6 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "inkling_mix(query, cur, blocks...)",
+     "inkling_situ(x)",
+     "inkling_conv(cur, past, weight)",
++    "inkling_proj(inputs, weights)",
+ 
+     "unary(x)",
+ 
+@@ -1243,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sleep(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6568,6 +6570,50 @@ struct ggml_tensor * ggml_inkling_conv(
+     return result;
+ }
+ 
++// ggml_inkling_proj
++
++struct ggml_tensor * ggml_inkling_proj(
++        struct ggml_context * ctx,
++        struct ggml_tensor ** inputs,
++        int                   n_inputs,
++        struct ggml_tensor ** weights,
++        const int           * input_of,
++        int                   n_weights) {
++    GGML_ASSERT(n_inputs >= 1 && n_inputs <= 3 && n_weights >= 1 && n_weights <= 7);
++
++    const int64_t n_embd   = inputs[0]->ne[0];
++    const int64_t n_tokens = inputs[0]->ne[1];
++
++    for (int i = 0; i < n_inputs; ++i) {
++        GGML_ASSERT(inputs[i]->type == GGML_TYPE_F32 && inputs[i]->nb[0] == sizeof(float));
++        GGML_ASSERT(inputs[i]->ne[0] == n_embd && inputs[i]->ne[1] == n_tokens && inputs[i]->ne[2] == 1 && inputs[i]->ne[3] == 1);
++    }
++
++    int64_t n_rows = 0;
++    for (int i = 0; i < n_weights; ++i) {
++        GGML_ASSERT(weights[i]->ne[0] == n_embd && weights[i]->ne[2] == 1 && weights[i]->ne[3] == 1);
++        GGML_ASSERT(input_of[i] >= 0 && input_of[i] < n_inputs);
++        n_rows += weights[i]->ne[1];
++    }
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rows, n_tokens);
++
++    ggml_set_op_params_i32(result, 0, n_weights);
++    for (int i = 0; i < n_weights; ++i) {
++        ggml_set_op_params_i32(result, 1 + i, input_of[i]);
++    }
++
++    result->op = GGML_OP_INKLING_PROJ;
++    for (int i = 0; i < 3; ++i) {
++        result->src[i] = inputs[i < n_inputs ? i : 0];
++    }
++    for (int i = 0; i < n_weights; ++i) {
++        result->src[3 + i] = weights[i];
++    }
++
++    return result;
++}
++
+ // ggml_inkling_situ
+ 
+ struct ggml_tensor * ggml_inkling_situ(
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index bfae87d08..7e3c99d28 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -402,12 +402,36 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         const float t  = hparams.f_qk_clip;
+         const float c  = 1.0f/sqrtf((is_swa ? 1 : 2)*hparams.n_shortconv_l_cache + 1);
+ 
+-        ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
+-        ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
++        // one token: the six projections that read the attention inputs in one op instead of six small mat-vecs
++        ggml_tensor * proj[6] = {};
++        static const bool no_fuse_proj = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_PROJ") != nullptr);
++        {
++            ggml_tensor * ws[6] = {layer.wq, layer.wk, layer.wv, layer.attn_rel, layer.attn_sink_proj, layer.wqkv_gate};
++            const int     of[6] = {0, 1, 2, 0, 0, 0};
++
++            bool fuse = !no_fuse_proj && n_tokens == 1 && (!loras || loras->empty());
++            for (ggml_tensor * w : ws) {
++                fuse = fuse && w && w->type == GGML_TYPE_Q8_0 && w->ne[0] == n_embd && w->ne[1] % 4 == 0;
++            }
++            if (fuse) {
++                ggml_tensor * all = ggml_inkling_proj(ctx0, inputs, 3, ws, of, 6);
++                size_t offs = 0;
++                for (int i = 0; i < 6; ++i) {
++                    proj[i] = ggml_view_2d(ctx0, all, ws[i]->ne[1], 1, ws[i]->ne[1]*sizeof(float), offs);
++                    offs += ws[i]->ne[1]*sizeof(float);
++                }
++            }
++        }
++        auto project = [&](int i, ggml_tensor * w, ggml_tensor * x) {
++            return proj[i] ? proj[i] : build_lora_mm(w, x);
++        };
++
++        ggml_tensor * Qcur = project(0, layer.wq, inputs[0]);
++        ggml_tensor * Kcur = convolve(project(1, layer.wk, inputs[1]), layer.attn_k_conv,
+                 is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0, false);
+-        ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
++        ggml_tensor * Vcur = convolve(project(2, layer.wv, inputs[2]), layer.attn_v_conv,
+                 is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa, false);
+-        ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
++        ggml_tensor * Rcur = project(3, layer.attn_rel, inputs[0]);
+ 
+         Qcur = ggml_l2_norm(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip), t);
+         Kcur = ggml_l2_norm(ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), t/c);
+@@ -429,7 +453,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
+         const int64_t n_kv     = rel_pos->ne[0];
+ 
+-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
++        ggml_tensor * sinks = project(4, layer.attn_sink_proj, inputs[0]);
+ 
+         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
+@@ -469,7 +493,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+                 nullptr, nullptr, nullptr,
+                 Qcur, Kcur, Vcur, kq_b, sinks_zero, t*t/sqrtf(n_embd_head), il);
+ 
+-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
++        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, project(5, layer.wqkv_gate, inputs[0])));
+         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+         cb(cur, "attn_out", il);
+     }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1ead49d97..e07c9a330 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4778,6 +4778,43 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
+     }
+ };
+ 
++// GGML_OP_INKLING_PROJ
++struct test_inkling_proj : public test_case {
++    const int64_t n_embd;
++    const int64_t n_tokens;
++    const std::vector<int64_t> rows;
++    const std::vector<int> input_of;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "INKLING_PROJ";
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR3(n_embd, n_tokens, rows.size());
++    }
++
++    test_inkling_proj(int64_t n_embd = 64, int64_t n_tokens = 1, std::vector<int64_t> rows = {8, 4, 12}, std::vector<int> input_of = {0, 1, 2})
++        : n_embd(n_embd), n_tokens(n_tokens), rows(rows), input_of(input_of) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * inputs[3];
++        for (int i = 0; i < 3; ++i) {
++            inputs[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
++            ggml_set_name(inputs[i], "x");
++        }
++        std::vector<ggml_tensor *> weights;
++        for (int64_t r : rows) {
++            weights.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, r));
++            ggml_set_name(weights.back(), "w");
++        }
++
++        ggml_tensor * out = ggml_inkling_proj(ctx, inputs, 3, weights.data(), input_of.data(), (int) weights.size());
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_INKLING_CONV
+ struct test_inkling_conv : public test_case {
+     const int64_t n_ch;
+@@ -11030,6 +11067,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
+     }
+ 
++    test_cases.emplace_back(new test_inkling_proj(64, 1, {8, 4, 12}, {0, 1, 2}));
++    test_cases.emplace_back(new test_inkling_proj(64, 3, {8, 4, 12, 4, 8, 4, 4}, {0, 0, 1, 2, 2, 1, 0}));
++    test_cases.emplace_back(new test_inkling_proj(2304, 1, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));
++    test_cases.emplace_back(new test_inkling_proj(2304, 2, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));
+     test_cases.emplace_back(new test_inkling_conv(64, 1, 1, 1.0f));
+     test_cases.emplace_back(new test_inkling_conv(1024, 4, 1, 1.0f));
+     test_cases.emplace_back(new test_inkling_conv(2304, 2, 2, 0.447f));
+-- 
+2.52.0.windows.1
+

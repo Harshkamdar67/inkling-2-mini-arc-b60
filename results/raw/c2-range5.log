@@ -1,0 +1,14 @@
+up on 8095
+=== c2-range5: 2 streams x 100000 tokens, pool 262144 02:04:55
+ first pass (reads the prompts):
+  stream 0: prompt 95050 tok, read 798 tok/s (first token 119.1 s), decode 15.3 tok/s over 200 tok
+  stream 1: prompt 95059 tok, read 424 tok/s (first token 224.0 s), decode 30.7 tok/s over 200 tok
+streams 2, prompt ~100000: decode sum 46.0 tok/s, degenerate 0/2, wall 231 s
+ second pass (contexts cached, streams decode together):
+  stream 0: prompt 95050 tok, read 70911 tok/s (first token 1.3 s), decode 19.3 tok/s over 200 tok
+  stream 1: prompt 95059 tok, read 72313 tok/s (first token 1.3 s), decode 19.3 tok/s over 200 tok
+streams 2, prompt ~100000: decode sum 38.5 tok/s, degenerate 0/2, wall 12 s
+10,559 MB
+19,615 MB
+3,837 MB
+=== c2-range5 done 02:09:00

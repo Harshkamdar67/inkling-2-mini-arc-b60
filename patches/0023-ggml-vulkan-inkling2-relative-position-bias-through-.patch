@@ -1,0 +1,805 @@
+From b7429e561c9868e46d2ca805f870c72ef00971eb Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 18:45:01 +0530
+Subject: [PATCH 23/32] ggml, vulkan, inkling2: relative-position bias through
+ a tagged mask shared by all heads, read inside flash attention
+
+---
+ ggml/include/ggml.h                           | 19 +++++
+ ggml/src/ggml-cpu/ggml-cpu.c                  |  5 ++
+ ggml/src/ggml-cpu/ops.cpp                     | 45 +++++++++-
+ ggml/src/ggml-cpu/ops.h                       |  1 +
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  | 14 ++++
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  1 +
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 61 +++++++++++++-
+ .../vulkan-shaders/flash_attn_prefill.comp    | 35 ++++++--
+ .../vulkan-shaders/inkling_tag_mask.comp      | 45 ++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  1 +
+ ggml/src/ggml.c                               | 48 ++++++++++-
+ src/llama-graph.cpp                           |  6 +-
+ src/models/inkling2.cpp                       | 15 +++-
+ tests/test-backend-ops.cpp                    | 82 +++++++++++++++++++
+ 14 files changed, 362 insertions(+), 16 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/inkling_tag_mask.comp
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 71ac840c1..80b29edce 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -421,6 +421,7 @@ extern "C" {
+         GGML_OP_INKLING_SITU,
+         GGML_OP_INKLING_CONV,
+         GGML_OP_INKLING_PROJ,
++        GGML_OP_INKLING_TAG_MASK,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2285,6 +2286,13 @@ extern "C" {
+             struct ggml_tensor * a,
+             int32_t              n_kv_max);
+ 
++    // relative-position bias without a mask per head: a mask value above 0.5 stands for 1 + distance, and the key's
++    // logit takes bias[distance, head, token] in place of the mask value. bias: F32 [n_dist, n_head, n_tokens],
++    // tokens in the order of q's dims 1 then 3. With it, sinks may also be per token: [n_head, n_tokens].
++    GGML_API void ggml_flash_attn_ext_set_rel_bias(
++            struct ggml_tensor * a,
++            struct ggml_tensor * bias);
++
+     GGML_API void ggml_flash_attn_ext_add_sinks(
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+@@ -2521,6 +2529,17 @@ extern "C" {
+             struct ggml_tensor  * weight,
+             float                 scale);
+ 
++    // Inkling 2: the attention mask shared by all heads with the keys within the relative-position extent tagged.
++    // rel_pos: I32 [n_kv, n_tokens] distances (n_extent or more when out of range), mask: F16 [n_kv, n_tokens/n_stream, 1, n_stream].
++    // Result, in the layout of mask: 1 + distance for a visible key at a distance below n_extent, else the mask value.
++    // bias_table (may be NULL) is not read; it rides along as a source for ggml_flash_attn_ext_set_rel_bias.
++    GGML_API struct ggml_tensor * ggml_inkling_tag_mask(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * rel_pos,
++            struct ggml_tensor  * mask,
++            struct ggml_tensor  * bias_table,
++            int                   n_extent);
++
+     // Inkling 2: several matrices times a few input vectors as one op, for the projections of a layer visit that
+     // read the same inputs. inputs: n_inputs <= 3 tensors [n_embd, n_tokens] with contiguous rows; weights:
+     // n_weights <= 7 matrices [n_embd, n_rows_i]; weight i multiplies inputs[input_of[i]].
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index eba6ee03c..3b3e27f16 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2141,6 +2141,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_inkling_proj(params, tensor);
+             } break;
++        case GGML_OP_INKLING_TAG_MASK:
++            {
++                ggml_compute_forward_inkling_tag_mask(params, tensor);
++            } break;
+         case GGML_OP_TOP_K_MASK:
+             {
+                 ggml_compute_forward_top_k_mask(params, tensor);
+@@ -2334,6 +2338,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_INKLING_SITU:
+         case GGML_OP_INKLING_CONV:
+         case GGML_OP_INKLING_PROJ:
++        case GGML_OP_INKLING_TAG_MASK:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 03e7b0490..8bfe27b94 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8869,6 +8869,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+     const ggml_tensor * kv_rows = dst->src[5];
++    const ggml_tensor * rel_bias = dst->src[6];
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+@@ -8978,10 +8979,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
+ 
+         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++            float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+             if (mv == -INFINITY) {
+                 continue;
+             }
++            if (rel_bias && mv > 0.5f) {
++                // 1 + distance: the bias of this head and token at that distance
++                mv = ((const float *) ((const char *) rel_bias->data + iq2*rel_bias->nb[1] + (iq1 + iq3*q->ne[1])*rel_bias->nb[2]))[(int64_t) mv - 1];
++            }
+ 
+             const int64_t ik1 = rows ? rows[ic] : ic;
+             if (ik1 < 0) {
+@@ -9036,7 +9041,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+ 
+         // sinks - apply only on the first kv-chunk
+         if (sinks && ic_start == 0) {
+-            const float s = ((float *)((char *) sinks->data))[h];
++            const float s = ((float *)((char *) sinks->data))[h + (sinks->ne[1] > 1 ? sinks->ne[0]*(iq1 + iq3*q->ne[1]) : 0)];
+ 
+             float ms = 1.0f;
+             float vs = 1.0f;
+@@ -9084,6 +9089,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+     const ggml_tensor * v     = dst->src[2];
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
++    const ggml_tensor * rel_bias = dst->src[6];
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+@@ -9239,6 +9245,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                             can_skip = false;
+                         }
++                        if (rel_bias && mask32[tq * KV_TILE_SZ + tk] > 0.5f) {
++                            mask32[tq * KV_TILE_SZ + tk] = ((const float *) ((const char *) rel_bias->data + iq2*rel_bias->nb[1] +
++                                    (iq1 + tq + iq3*q->ne[1])*rel_bias->nb[2]))[(int64_t) mask32[tq * KV_TILE_SZ + tk] - 1];
++                        }
+                     }
+                     // Pad remaining mask entries with -inf
+                     for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
+@@ -9336,9 +9346,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+ 
+         // sinks (apply only to valid rows in the tile)
+         if (sinks) {
+-            const float s = ((float *)((char *) sinks->data))[h];
+-
+             for (int tq = 0; tq < tile_rows; tq++) {
++                const float s = ((float *)((char *) sinks->data))[h + (sinks->ne[1] > 1 ? sinks->ne[0]*(iq1 + tq + iq3*q->ne[1]) : 0)];
+                 float ms = 1.0f;
+                 float vs = 1.0f;
+ 
+@@ -11562,6 +11571,34 @@ void ggml_compute_forward_dsv4_hc_pre(
+     }
+ }
+ 
++// ggml_compute_forward_inkling_tag_mask
++
++void ggml_compute_forward_inkling_tag_mask(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * rel_pos = dst->src[0];
++    const ggml_tensor * mask    = dst->src[1];
++
++    const int32_t n_extent = ggml_get_op_params_i32(dst, 0);
++    const int64_t n_kv     = rel_pos->ne[0];
++    const int64_t n_tokens = rel_pos->ne[1];
++    const int64_t n_tps    = mask->ne[1];
++
++    for (int64_t tt = params->ith; tt < n_tokens; tt += params->nth) {
++        const int64_t s = tt / n_tps;
++        const int64_t t = tt % n_tps;
++
++        const int32_t     * p = (const int32_t *) rel_pos->data + n_kv*tt;
++        const ggml_fp16_t * m = (const ggml_fp16_t *) ((const char *) mask->data + t*mask->nb[1] + s*mask->nb[3]);
++        ggml_fp16_t       * d = (ggml_fp16_t *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
++
++        for (int64_t kv = 0; kv < n_kv; ++kv) {
++            const bool near = GGML_CPU_FP16_TO_FP32(m[kv]) == 0.0f && p[kv] >= 0 && p[kv] < n_extent;
++            d[kv] = near ? GGML_CPU_FP32_TO_FP16((float) (p[kv] + 1)) : m[kv];
++        }
++    }
++}
++
+ // ggml_compute_forward_inkling_proj
+ 
+ void ggml_compute_forward_inkling_proj(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index a6f7a4ab9..f9004c530 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -113,6 +113,7 @@ void ggml_compute_forward_inkling_mix(const struct ggml_compute_params * params,
+ void ggml_compute_forward_inkling_situ(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_inkling_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_inkling_proj(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_inkling_tag_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_top_k_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index e18d840e2..b98cd40dd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -178,6 +178,7 @@ struct vk_xe_fa_push_constants {
+     uint32_t nb3;
+     uint32_t flag;
+     float scale;
++    uint32_t rel_dist;
+ };
+ 
+ struct vk_op_push_constants {
+@@ -232,6 +233,19 @@ struct vk_op_dsv4_hc_pre_push_constants {
+     float scale;
+ };
+ 
++struct vk_op_inkling_tag_mask_push_constants {
++    uint32_t n_kv;
++    uint32_t n_tps;
++    uint32_t n_extent;
++    uint32_t nbm1;
++    uint32_t nbm3;
++    uint32_t nbd1;
++    uint32_t nbd3;
++    uint32_t p_offset;
++    uint32_t m_offset;
++    uint32_t d_offset;
++};
++
+ struct vk_op_inkling_proj_push_constants {
+     uint32_t n_embd;
+     uint32_t n_w;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 3b0e1761a..ce021158f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1003,6 +1003,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_inkling_situ_f32;
+     vk_pipeline pipeline_inkling_conv_f32;
+     vk_pipeline pipeline_inkling_proj_q8_0;
++    vk_pipeline pipeline_inkling_tag_mask_f16;
+     vk_pipeline pipeline_dsv4_hc_post_nocomb_f32;
+     vk_pipeline pipeline_top_k_mask_f16;
+     vk_pipeline pipeline_top_k_mask_f32;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c54d7e077..e89a3728f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3638,7 +3638,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                                          pipeline_state.HSK, pipeline_state.HSV, pipeline_state.qk_ratio, xe_fa_params.prefill_params.p_per_iter,
+                                          xe_fa_params.tm, xe_fa_params.tn, xe_fa_params.prefill_params.q_in_reg, shmem_sz, xe_fa_params.prefill_params.acc_count,
+                                          xe_fa_params.prefill_params.pipeline_flag, xe_fa_params.subgroup_size[0], xe_fa_params.prefill_params.gqa_fold };
+-            ggml_vk_create_pipeline(device, pipelines, "xe_fa_prefill", fa_prefill_cm1_len, fa_prefill_cm1_data, "main", 6, sizeof(vk_xe_fa_push_constants), { xe_fa_params.prefill_params.gqa_fold, xe_fa_params.prefill_params.wg_row / xe_fa_params.prefill_params.gqa_fold, 1 }, sc, 1, false, true, xe_fa_params.subgroup_size[0]);
++            ggml_vk_create_pipeline(device, pipelines, "xe_fa_prefill", fa_prefill_cm1_len, fa_prefill_cm1_data, "main", 7, sizeof(vk_xe_fa_push_constants), { xe_fa_params.prefill_params.gqa_fold, xe_fa_params.prefill_params.wg_row / xe_fa_params.prefill_params.gqa_fold, 1 }, sc, 1, false, true, xe_fa_params.subgroup_size[0]);
+         }
+     }
+ #endif
+@@ -4093,6 +4093,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_conv_f32, "inkling_conv_f32", inkling_conv_f32_len, inkling_conv_f32_data, "main", 4, sizeof(vk_op_inkling_conv_push_constants), {256, 1, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_inkling_tag_mask_f16, "inkling_tag_mask_f16", inkling_tag_mask_f16_len, inkling_tag_mask_f16_data, "main", 3, sizeof(vk_op_inkling_tag_mask_push_constants), {256, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_proj_q8_0, "inkling_proj_q8_0", inkling_proj_q8_0_len, inkling_proj_q8_0_data, "main", 11, sizeof(vk_op_inkling_proj_push_constants), {4, 1, 1}, { 32 }, 1, false, true);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_situ_f32, "inkling_situ_f32", inkling_situ_f32_len, inkling_situ_f32_data, "main", 2, sizeof(vk_op_inkling_situ_push_constants), {256, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_inkling_mix_f32[0], "inkling_mix_a_f32", inkling_mix_f32_len, inkling_mix_f32_data, "main", 11, sizeof(vk_op_inkling_mix_push_constants), {256, 1, 1}, { 256, 0 }, 1, false, true);
+@@ -8206,6 +8207,28 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
+     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+ }
+ 
++void ggml_vk_inkling_tag_mask(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
++    const ggml_tensor * rel_pos = dst->src[0];
++    const ggml_tensor * mask    = dst->src[1];
++
++    vk_pipeline pipeline = ctx->device->pipeline_inkling_tag_mask_f16;
++    GGML_ASSERT(pipeline != nullptr);
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    const vk_op_inkling_tag_mask_push_constants pc = {
++        (uint32_t) rel_pos->ne[0], (uint32_t) mask->ne[1], (uint32_t) ggml_get_op_params_i32(dst, 0),
++        ggml_vk_nb_elem(mask, 1), ggml_vk_nb_elem(mask, 3), ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 3),
++        (uint32_t) (get_misalign_bytes(ctx, rel_pos) / sizeof(int32_t)),
++        (uint32_t) (get_misalign_bytes(ctx, mask) / sizeof(ggml_fp16_t)),
++        (uint32_t) (get_misalign_bytes(ctx, dst) / sizeof(ggml_fp16_t)),
++    };
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
++        { ggml_vk_tensor_subbuffer(ctx, rel_pos, true), ggml_vk_tensor_subbuffer(ctx, mask, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
++        pc, { (uint32_t) rel_pos->ne[0], (uint32_t) rel_pos->ne[1], 1 });
++}
++
+ void ggml_vk_inkling_proj(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+     const int n_w = ggml_get_op_params_i32(dst, 0);
+ 
+@@ -9261,6 +9284,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
+ }
+ 
+ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
++    // relative-position bias behind a tagged mask (ggml_flash_attn_ext_set_rel_bias): only the Xe prefill kernel reads it
++    const ggml_tensor * rel_bias = dst->src[6];
+     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
+     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
+     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
+@@ -9827,6 +9852,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+                                               mask_n_head_log2, m0, m1,
+                                               gqa_ratio, split_kv, split_k };
+ 
++    GGML_ASSERT(xe_fa_opt || (!rel_bias && !(sinks && sinks->ne[1] > 1)));
+     if (xe_fa_opt) {
+         uint32_t head_stride_q = uint32_t(nbq2 / ggml_type_size(q->type));
+         uint32_t head_stride_k = xe_fa_dequant_kv ? uint32_t(nbk2_eff / sizeof(ggml_fp16_t)) : uint32_t(nbk2 / ggml_type_size(k->type));
+@@ -9867,6 +9893,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+                 { q_temp_buf, k_buf, mask_buf, p_temp_buf, max_temp_buf },
+                 pc_xe_fa, { (uint32_t)ph1_wg, (uint32_t)nek1, (uint32_t)neq3 });
+ 
++            GGML_ASSERT(!rel_bias && !(sinks && sinks->ne[1] > 1));
+             ggml_vk_sync_buffers(ctx, subctx);
+             ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline_dual_phases.second, 1);
+             ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline_dual_phases.second,
+@@ -9875,12 +9902,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+ 
+             ctx->prealloc_x_need_sync = true;
+         } else {
++            if (rel_bias) {
++                // tagged mask: bias table as a seventh buffer, and sinks per token when they come that way
++                pc_xe_fa.flag |= 1u << 17;
++                pc_xe_fa.rel_dist = (uint32_t) rel_bias->ne[0];
++            }
++            if (sinks && sinks->ne[1] > 1) {
++                pc_xe_fa.flag |= 1u << 18;
++            }
+             ggml_pipeline_request_descriptor_sets(ctx, xe_fa_pipeline, 1);
+             ggml_vk_dispatch_pipeline(ctx, subctx, xe_fa_pipeline,
+-                { q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf },
++                { q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, rel_bias ? ggml_vk_tensor_subbuffer(ctx, rel_bias) : mask_buf },
+                 pc_xe_fa, { (uint32_t)neq2, (uint32_t)neq1, (uint32_t)neq3 });
+         }
+     } else if (split_k > 1) {
++        GGML_ASSERT(!rel_bias && !(sinks && sinks->ne[1] > 1));
+         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+ 
+         if (ctx->prealloc_split_k_need_sync) {
+@@ -14104,6 +14140,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+     case GGML_OP_INKLING_PROJ:
+         ggml_vk_inkling_proj(ctx, compute_ctx, node);
+ 
++        break;
++    case GGML_OP_INKLING_TAG_MASK:
++        ggml_vk_inkling_tag_mask(ctx, compute_ctx, node);
++
+         break;
+     case GGML_OP_MEAN:
+         ggml_vk_mean(ctx, compute_ctx, src0, node);
+@@ -17094,6 +17134,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 if (op->src[5] != nullptr) {
+                     return false;
+                 }
++                // a tagged mask with a bias table, or sinks per token: the Xe prefill kernel only (batches of more than 8 tokens)
++                if (op->src[6] != nullptr || (op->src[4] && op->src[4]->ne[1] > 1)) {
++                    if (!device->xe_fa_support || op->src[0]->ne[1] <= 8 || op->src[0]->ne[0] % 32 != 0 || op->src[2]->ne[0] % 16 != 0 ||
++                            op->src[3] == nullptr || op->src[0]->ne[2] / op->src[2]->ne[2] > 64) {
++                        return false;
++                    }
++                    // a quantized cache reaches that kernel through the dense F16 scratch: batches of 64 or more, cache layout
++                    for (int i = 1; i <= 2; ++i) {
++                        const ggml_tensor * t = op->src[i];
++                        if (t->type != GGML_TYPE_F16 &&
++                                (op->src[0]->ne[1] < 64 || t->nb[2] != ggml_row_size(t->type, t->ne[0]) || t->nb[1] != t->nb[2]*t->ne[2])) {
++                            return false;
++                        }
++                    }
++                }
+                 bool coopmat2 = device->coopmat2;
+                 uint32_t HSK = op->src[1]->ne[0];
+                 uint32_t HSV = op->src[2]->ne[0];
+@@ -17391,6 +17446,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             return op->src[0]->nb[0] == sizeof(float);
+         case GGML_OP_INKLING_CONV:
+             return op->src[1]->ne[1] <= 65535*256 && op->src[0]->ne[1] <= 65535;
++        case GGML_OP_INKLING_TAG_MASK:
++            return op->src[0]->ne[1] <= 65535;
+         case GGML_OP_INKLING_PROJ:
+             // Q8_0 matrices only, four rows per workgroup, whole blocks per thread
+             if (!device->subgroup_arithmetic || !device->subgroup_require_full_support || op->src[0]->ne[0] % 32 != 0) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp
+index 407654ca5..2c9345f53 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp
+@@ -24,6 +24,8 @@ layout (binding = 3) readonly buffer MV2 {f16vec2 data_mv2[];};
+ layout (binding = 3) readonly buffer MV4 {f16vec4 data_mv4[];};
+ layout (binding = 4) readonly buffer S {float data_s[];};
+ layout (binding = 5) buffer OV4 {vec4 data_ov4[];};
++// relative-position bias [rel_dist, n_head_q, n_tokens], read where the mask holds 1 + distance (REL_BIAS_BIT)
++layout (binding = 6) readonly buffer RB {float data_rb[];};
+ 
+ layout (push_constant) uniform parameter
+ {
+@@ -50,6 +52,7 @@ layout (push_constant) uniform parameter
+     uint nb3;
+     uint flag;
+     float scale;
++    uint rel_dist;
+ } p;
+ 
+ layout (constant_id = 0) const uint WorkGroupSize = 256;
+@@ -73,6 +76,8 @@ layout (constant_id = 14) const uint gqa_fold = 1;
+ #define PARTIAL_ROW_MASK_BIT (1 << 2)
+ #define INTEL_GPU_BIT (1 << 3)
+ #define SINK_ENABLE_BIT (1 << 16)
++#define REL_BIAS_BIT (1 << 17)
++#define SINK_PER_ROW_BIT (1 << 18)
+ 
+ const bool aligned_q_stride = (Flags & UNALIGNED_Q_STRIDE_BIT) == 0;
+ const bool seq_boundary_check = (Flags & UNALIGNED_SEQ_LEN_BIT) != 0;
+@@ -238,7 +243,12 @@ void main() {
+     const uint psh_store_offset = (psh_base + sg * TN * step_p + lane_c * step_p) * 2 + lane_r * softmax_loops;
+     const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+     const float16_t NEG_F16_MAX_OVER_2 = float16_t(NEG_FLT_MAX_OVER_2);
+-    const float sink = ((p.flag & SINK_ENABLE_BIT) != 0) ? data_s[head_q_idx * gqa_fold + sg_o_r_h] : 0.0f;
++    // this lane's query: its head and its token (dims 1 then 3 of q)
++    const uint q_head = head_q_idx * gqa_fold + sg_o_r_h;
++    const uint q_tok = min(out_r * folded_row_wg + sg_o_r_row * TN + lane_c, p.neq1 - 1) + batch_idx * p.neq1;
++    const uint rb_base = p.rel_dist * (q_head + p.neq2 * q_tok);
++    const float sink = ((p.flag & SINK_ENABLE_BIT) != 0) ?
++        data_s[q_head + ((p.flag & SINK_PER_ROW_BIT) != 0 ? p.neq2 * q_tok : 0u)] : 0.0f;
+     coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> QMat[matq_count];
+     uint ksh_offset[k_loops];
+     bool mask_load_k[k_loops];
+@@ -506,17 +516,19 @@ void main() {
+                 Pf[idx] = F32Poolsh.F32sh[psh_load_offset + idx];
+             }
+ 
++            float Mk[softmax_loops];
++
+             if (mask_in_shmem) {
+                 [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
+-                    Pf[idx] += float(F16Poolsh.F16sh[msh_load_offset + idx]);
++                    Mk[idx] = float(F16Poolsh.F16sh[msh_load_offset + idx]);
+                 }
+             } else {
+                 if (seq_boundary_check) {
+                     [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
+                         if (loop * step_p + idx + lane_r * softmax_loops < p.nek1) {
+-                            Pf[idx] += mask_row_valid ? float(data_m[m_offset + idx]) : 0.0f;
++                            Mk[idx] = mask_row_valid ? float(data_m[m_offset + idx]) : 0.0f;
+                         } else {
+-                            Pf[idx] += NEG_FLT_MAX_OVER_2;
++                            Mk[idx] = NEG_FLT_MAX_OVER_2;
+                         }
+                     }
+                     m_offset += step_p;
+@@ -525,13 +537,26 @@ void main() {
+                         f16vec4 mv4_temp = mask_row_valid ? data_mv4[m_offset + idx] : f16vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                         float mask_f_temp[4] = float[4](float(mv4_temp.x), float(mv4_temp.y), float(mv4_temp.z), float(mv4_temp.w));
+                         [[unroll]] for (uint vec_idx = 0; vec_idx < 4; ++vec_idx) {
+-                            Pf[4 * idx + vec_idx] += mask_f_temp[vec_idx];
++                            Mk[4 * idx + vec_idx] = mask_f_temp[vec_idx];
+                         }
+                     }
+                     m_offset += step_p / 4;
+                 }
+             }
+ 
++            if ((p.flag & REL_BIAS_BIT) != 0) {
++                // a mask value above 0.5 is 1 + distance: that key takes this head's bias at the distance instead
++                [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
++                    if (Mk[idx] > 0.5f) {
++                        Mk[idx] = data_rb[rb_base + uint(Mk[idx]) - 1u];
++                    }
++                }
++            }
++
++            [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
++                Pf[idx] += Mk[idx];
++            }
++
+             if (seq_boundary_check && loop + 1 == loop_count) {
+                 [[unroll]] for (uint idx = 0; idx < softmax_loops; ++idx) {
+                     if (loop * step_p + idx + lane_r * softmax_loops < p.nek1) {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/inkling_tag_mask.comp b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_tag_mask.comp
+new file mode 100644
+index 000000000..be2d127e6
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/inkling_tag_mask.comp
+@@ -0,0 +1,45 @@
++#version 450
++
++#extension GL_EXT_shader_16bit_storage : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++
++// Inkling 2 attention mask shared by all heads, with the keys inside the relative-position extent tagged:
++// a visible key at distance d < n_extent holds 1 + d, every other key keeps its mask value (0 or -inf).
++// Flash attention then reads the bias of each head at that distance from a table (ggml_flash_attn_ext_set_rel_bias)
++// and no mask per head is built.
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout(push_constant) uniform parameter
++{
++    uint n_kv;
++    uint n_tps;     // tokens per stream
++    uint n_extent;
++    uint nbm1;      // mask strides, elements
++    uint nbm3;
++    uint nbd1;      // dst strides, elements
++    uint nbd3;
++    uint p_offset;
++    uint m_offset;
++    uint d_offset;
++};
++
++layout(binding = 0) readonly  buffer P { int       data_p[]; };
++layout(binding = 1) readonly  buffer M { float16_t data_m[]; };
++layout(binding = 2) writeonly buffer D { float16_t data_d[]; };
++
++void main() {
++    const uint kv = gl_GlobalInvocationID.x;
++    const uint tt = gl_WorkGroupID.y;
++    if (kv >= n_kv) {
++        return;
++    }
++    const uint s = tt / n_tps;
++    const uint t = tt % n_tps;
++
++    const int       dist = data_p[p_offset + n_kv*tt + kv];
++    const float16_t m    = data_m[m_offset + t*nbm1 + s*nbm3 + kv];
++
++    data_d[d_offset + t*nbd1 + s*nbd3 + kv] =
++        (float(m) == 0.0 && dist >= 0 && uint(dist) < n_extent) ? float16_t(float(dist + 1)) : m;
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 2ae10aaee..e7b86380f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1092,6 +1092,7 @@ void process_shaders() {
+     string_to_spv("inkling_situ_f32", "inkling_situ.comp", {});
+     string_to_spv("inkling_conv_f32", "inkling_conv.comp", {});
+     string_to_spv("inkling_proj_q8_0", "inkling_proj.comp", {});
++    string_to_spv("inkling_tag_mask_f16", "inkling_tag_mask.comp", {});
+     string_to_spv("top_k_mask_f16", "top_k_mask.comp", {{"MASK_TYPE", "uint16_t"}});
+     string_to_spv("top_k_mask_f32", "top_k_mask.comp", {{"MASK_TYPE", "uint"}});
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1568d5141..a325fd118 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1105,6 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "INKLING_SITU",
+     "INKLING_CONV",
+     "INKLING_PROJ",
++    "INKLING_TAG_MASK",
+ 
+     "UNARY",
+ 
+@@ -1124,7 +1125,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "SLEEP",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1226,6 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "inkling_situ(x)",
+     "inkling_conv(cur, past, weight)",
+     "inkling_proj(inputs, weights)",
++    "inkling_tag_mask(rel_pos, mask)",
+ 
+     "unary(x)",
+ 
+@@ -1245,7 +1247,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sleep(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5534,10 +5536,23 @@ void ggml_flash_attn_ext_add_sinks(
+     GGML_ASSERT(a->src[4] == NULL);
+     GGML_ASSERT(a->src[0]->ne[2] == sinks->ne[0]);
+     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
++    // one row per head, or one per head and token
++    GGML_ASSERT(sinks->ne[1] == 1 || (sinks->ne[1] == a->src[0]->ne[1]*a->src[0]->ne[3] && sinks->nb[1] == sinks->ne[0]*sizeof(float)));
+ 
+     a->src[4] = sinks;
+ }
+ 
++void ggml_flash_attn_ext_set_rel_bias(
++        struct ggml_tensor * a,
++        struct ggml_tensor * bias) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(a->src[3] != NULL && a->src[5] == NULL && a->src[6] == NULL);
++    GGML_ASSERT(bias->type == GGML_TYPE_F32 && ggml_is_contiguous(bias));
++    GGML_ASSERT(bias->ne[1] == a->src[0]->ne[2] && bias->ne[2] == a->src[0]->ne[1]*a->src[0]->ne[3]);
++
++    a->src[6] = bias;
++}
++
+ // ggml_flash_attn_back
+ 
+ struct ggml_tensor * ggml_flash_attn_back(
+@@ -6570,6 +6585,35 @@ struct ggml_tensor * ggml_inkling_conv(
+     return result;
+ }
+ 
++// ggml_inkling_tag_mask
++
++struct ggml_tensor * ggml_inkling_tag_mask(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * rel_pos,
++        struct ggml_tensor  * mask,
++        struct ggml_tensor  * bias_table,
++        int                   n_extent) {
++    const int64_t n_kv     = rel_pos->ne[0];
++    const int64_t n_tokens = rel_pos->ne[1];
++
++    GGML_ASSERT(rel_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(rel_pos));
++    GGML_ASSERT(mask->type == GGML_TYPE_F16 && mask->ne[0] == n_kv && mask->ne[2] == 1 && mask->ne[1]*mask->ne[3] == n_tokens);
++    GGML_ASSERT(mask->nb[0] == sizeof(ggml_fp16_t));
++    // 1 + distance must stay exact in F16
++    GGML_ASSERT(n_extent > 0 && n_extent <= 2047);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, mask->ne[1], 1, mask->ne[3]);
++
++    ggml_set_op_params_i32(result, 0, n_extent);
++
++    result->op     = GGML_OP_INKLING_TAG_MASK;
++    result->src[0] = rel_pos;
++    result->src[1] = mask;
++    result->src[2] = bias_table;
++
++    return result;
++}
++
+ // ggml_inkling_proj
+ 
+ struct ggml_tensor * ggml_inkling_proj(
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 315479f28..861d80b97 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3245,6 +3245,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         }
+         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
++        if (kq_mask && kq_mask->op == GGML_OP_INKLING_TAG_MASK && kq_mask->src[2]) {
++            // the mask tags the keys near each query; their bias per head comes from the table the tag op carries
++            ggml_flash_attn_ext_set_rel_bias(cur, kq_mask->src[2]);
++        }
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+@@ -4522,7 +4526,7 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+     ggml_tensor * kq_mask = attn_mask.raw;
+-    if (kq_b->op == GGML_OP_INKLING_REL_MASK) {
++    if (kq_b->op == GGML_OP_INKLING_REL_MASK || kq_b->op == GGML_OP_INKLING_TAG_MASK) {
+         // the model built the whole mask, bias and input mask together, in the type flash attention takes
+         kq_mask = kq_b;
+     } else {
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 7e3c99d28..6cfaeb970 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -460,7 +460,18 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         ggml_tensor * mask_raw = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+         static const bool no_fuse_mask = (getenv("LLAMA_INKLING_NO_FUSE") != nullptr || getenv("LLAMA_INKLING_NO_MASK") != nullptr);
+         ggml_tensor * kq_b = nullptr;
+-        if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
++        // long caches, batches: one mask for all heads with the keys within the extent tagged, the bias of each head
++        // read from a table inside flash attention and the sink passed per token. No mask per head (n_kv x n_tokens x
++        // n_head) is built or read. Needs a backend whose flash attention takes ggml_flash_attn_ext_set_rel_bias
++        // (Vulkan on Xe, the CPU), so it is opt-in: LLAMA_INKLING_REL_TAG=1.
++        static const bool rel_tag = getenv("LLAMA_INKLING_REL_TAG") != nullptr && getenv("LLAMA_INKLING_NO_FUSE") == nullptr;
++        const bool use_tag = rel_tag && !is_swa && n_tokens >= 32 && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 &&
++                             layer.attn_rel_bias->type == GGML_TYPE_F32 && layer.attn_rel_bias->ne[1] <= 2047;
++        if (use_tag) {
++            // [n_extent + 1, n_head, n_tokens]
++            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
++            kq_b = ggml_inkling_tag_mask(ctx0, rel_pos, mask_raw, table, (int) layer.attn_rel_bias->ne[1]);
++        } else if (!no_fuse_mask && cparams.flash_attn && mask_raw->type == GGML_TYPE_F16 && layer.attn_rel_bias->type == GGML_TYPE_F32) {
+             // the whole per-head mask in one op, written once in F16: bias row by distance, minus the sink, plus the mask
+             kq_b = ggml_inkling_rel_mask(ctx0, Rcur, layer.attn_rel_bias, sinks, rel_pos, mask_raw, GGML_TYPE_F16);
+         }
+@@ -491,7 +502,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+         cur = build_attn(inp,
+                 nullptr, nullptr, nullptr,
+-                Qcur, Kcur, Vcur, kq_b, sinks_zero, t*t/sqrtf(n_embd_head), il);
++                Qcur, Kcur, Vcur, kq_b, use_tag ? sinks : sinks_zero, t*t/sqrtf(n_embd_head), il);
+ 
+         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, project(5, layer.wqkv_gate, inputs[0])));
+         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e07c9a330..2aa7ab108 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4778,6 +4778,83 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
+     }
+ };
+ 
++// GGML_OP_FLASH_ATTN_EXT with a tagged mask (GGML_OP_INKLING_TAG_MASK) and a relative-position bias table
++struct test_flash_attn_rel : public test_case {
++    const int64_t n_kv;
++    const int64_t n_tokens;
++    const int64_t n_extent;
++    const ggml_type type_KV;
++    const bool sinks_per_token;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "FLASH_ATTN_REL";
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR5(n_kv, n_tokens, n_extent, type_KV, sinks_per_token);
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_flash_attn_rel(int64_t n_kv = 2560, int64_t n_tokens = 64, int64_t n_extent = 1024, ggml_type type_KV = GGML_TYPE_F16, bool sinks_per_token = true)
++        : n_kv(n_kv), n_tokens(n_tokens), n_extent(n_extent), type_KV(type_KV), sinks_per_token(sinks_per_token) {}
++
++    void initialize_tensors(ggml_context * ctx) override {
++        std::mt19937 rng(11);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                // distances, about half of them past the extent
++                std::vector<int32_t> v(ggml_nelements(t));
++                std::uniform_int_distribution<int32_t> dist(0, (int32_t) (2*n_extent));
++                for (auto & x : v) {
++                    x = dist(rng);
++                }
++                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
++            } else if (strcmp(t->name, "mask") == 0) {
++                // a quarter of the keys hidden
++                std::vector<ggml_fp16_t> v(ggml_nelements(t));
++                std::uniform_int_distribution<int> hide(0, 3);
++                for (auto & x : v) {
++                    x = ggml_fp32_to_fp16(hide(rng) == 0 ? -INFINITY : 0.0f);
++                }
++                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(ggml_fp16_t));
++            } else {
++                init_tensor_uniform(t, -1.0f, 1.0f);
++            }
++        }
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t hs = 128, n_head = 24, n_head_kv = 8;
++
++        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, n_tokens, n_head, 1);
++        // the cache layout: [head_dim, n_head_kv, n_kv] storage, read through a permuted view
++        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, n_kv, 1);
++        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hs, n_head_kv, n_kv, 1);
++        ggml_tensor * rel_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
++        ggml_tensor * mask    = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens, 1, 1);
++        ggml_tensor * table   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_extent + 1, n_head, n_tokens);
++        ggml_tensor * sinks   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, sinks_per_token ? n_tokens : 1);
++        ggml_set_name(q, "q");
++        ggml_set_name(k, "k");
++        ggml_set_name(v, "v");
++        ggml_set_name(rel_pos, "rel_pos");
++        ggml_set_name(mask, "mask");
++        ggml_set_name(table, "table");
++        ggml_set_name(sinks, "sinks");
++
++        ggml_tensor * tag = ggml_inkling_tag_mask(ctx, rel_pos, mask, table, (int) n_extent);
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, ggml_permute(ctx, k, 0, 2, 1, 3), ggml_permute(ctx, v, 0, 2, 1, 3), tag, 1.0f/sqrtf(hs), 0.0f, 0.0f);
++        ggml_flash_attn_ext_set_rel_bias(out, table);
++        ggml_flash_attn_ext_add_sinks(out, sinks);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_INKLING_PROJ
+ struct test_inkling_proj : public test_case {
+     const int64_t n_embd;
+@@ -11067,6 +11144,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
+     }
+ 
++    test_cases.emplace_back(new test_flash_attn_rel(2560, 64, 1024, GGML_TYPE_F16, true));
++    test_cases.emplace_back(new test_flash_attn_rel(2560, 256, 1024, GGML_TYPE_F16, true));
++    test_cases.emplace_back(new test_flash_attn_rel(5000, 128, 1024, GGML_TYPE_F16, false));
++    test_cases.emplace_back(new test_flash_attn_rel(2560, 128, 1024, GGML_TYPE_Q4_0, true));
++    test_cases.emplace_back(new test_flash_attn_rel(4096, 256, 1024, GGML_TYPE_Q8_0, true));
+     test_cases.emplace_back(new test_inkling_proj(64, 1, {8, 4, 12}, {0, 1, 2}));
+     test_cases.emplace_back(new test_inkling_proj(64, 3, {8, 4, 12, 4, 8, 4, 4}, {0, 0, 1, 2, 2, 1, 0}));
+     test_cases.emplace_back(new test_inkling_proj(2304, 1, {3072, 3072, 384, 24, 1024, 1024}, {0, 0, 0, 0, 1, 2}));
+-- 
+2.52.0.windows.1
+

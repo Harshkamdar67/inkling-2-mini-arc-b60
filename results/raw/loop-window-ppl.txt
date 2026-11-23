@@ -1,0 +1,5 @@
+window 0: Final estimate: PPL = 6.1345 +/- 0.07942
+window 1024: Final estimate: PPL = 6.4575 +/- 0.08432
+window 4096: Final estimate: PPL = 6.2010 +/- 0.08051
+window 8192: Final estimate: PPL = 6.1571 +/- 0.07981
+window 16384: Final estimate: PPL = 6.1328 +/- 0.07939

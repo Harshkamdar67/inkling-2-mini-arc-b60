@@ -1,0 +1,32 @@
+From e77c0e9b588cc63224e6e94368815a7169172bf6 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sat, 21 Nov 2026 23:42:23 +0530
+Subject: [PATCH 10/32] graph: copy logits row views for backend sampling when
+ rows are not 256-byte aligned
+
+An unpadded vocabulary (Inkling 2: 200058) puts the second sequence's logits row at an offset
+Vulkan cannot bind, so backend sampling with two sequences asserted. Copying every row keeps the
+graph topology fixed. B60, Inkling 2 Mini: two streams 48.7 -> 52.5 tok/s total with -bs.
+---
+ src/llama-graph.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d8f91a1df..4cc238db7 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4763,6 +4763,11 @@ void llm_graph_context::build_sampling() const {
+             const int      i_out  = active ? 1       : 0;
+ 
+             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
++            if (logits_t->nb[1] % 256 != 0) {
++                // with a row size that is not a multiple of 256 bytes (an unpadded vocabulary) the row views start
++                // where some backends cannot bind a buffer; copy them, for every row so the graph keeps its topology
++                logits_seq = ggml_cont(ctx0, logits_seq);
++            }
+             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
+ 
+             struct llama_sampler_data data = {
+-- 
+2.52.0.windows.1
+

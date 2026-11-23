@@ -1,0 +1,551 @@
+From e37256b49fcddb48a6329639c6f44ce7bf4fa768 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 20:36:01 +0530
+Subject: [PATCH 26/32] vulkan: the Q4_0 decode attention kernels take two
+ tokens a step (two streams decoding together)
+
+---
+ .../ggml-vulkan/ggml-vulkan-push-constants.h  |   9 ++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  40 ++++---
+ .../ggml-vulkan/vulkan-shaders/fa_q4_max.comp |   4 +-
+ .../vulkan-shaders/fa_q4_query.comp           |  10 +-
+ .../vulkan-shaders/fa_q4_reduce.comp          |  13 +-
+ .../vulkan-shaders/fa_q4_scores.comp          |  34 +++---
+ .../vulkan-shaders/fa_q4_values.comp          | 111 ++++++++++--------
+ tests/test-backend-ops.cpp                    |   5 +-
+ 8 files changed, 136 insertions(+), 90 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index c167d27b7..edd806019 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -234,9 +234,11 @@ struct vk_op_dsv4_hc_pre_push_constants {
+ };
+ 
+ struct vk_fa_q4_query_push_constants {
++    uint32_t nbq1;
+     uint32_t nbq2;
+     uint32_t q_offset;
+     uint32_t off_q;
++    uint32_t n_head_q;
+ };
+ 
+ struct vk_fa_q4_scores_push_constants {
+@@ -244,6 +246,10 @@ struct vk_fa_q4_scores_push_constants {
+     uint32_t n_head_kv;
+     uint32_t r;
+     uint32_t nem2;
++    uint32_t nbm1;
++    uint32_t nbm2;
++    uint32_t n_tok;
++    uint32_t n_head_q;
+     uint32_t m_offset;
+     uint32_t s_stride;
+     uint32_t n_wg;
+@@ -262,6 +268,8 @@ struct vk_fa_q4_values_push_constants {
+     uint32_t n_kv;
+     uint32_t n_head_kv;
+     uint32_t r;
++    uint32_t n_tok;
++    uint32_t n_head_q;
+     uint32_t s_stride;
+     uint32_t n_wg;
+     uint32_t off_mg;
+@@ -275,6 +283,7 @@ struct vk_fa_q4_reduce_push_constants {
+     uint32_t off_p;
+     uint32_t d_offset;
+     uint32_t has_sinks;
++    uint32_t n_head_q;
+ };
+ 
+ struct vk_op_inkling_tag_mask_push_constants {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 4991c5625..0b50a810f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -9321,6 +9321,8 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
+     const int64_t n_kv      = k->ne[1];
+     const int64_t n_head_kv = k->ne[2];
+     const int64_t n_head_q  = q->ne[2];
++    const int64_t n_tok     = q->ne[1];
++    const int64_t n_q       = n_tok*n_head_q;   // queries: token-major, then head
+     const int64_t r         = n_head_kv > 0 ? n_head_q/n_head_kv : 0;
+ 
+     auto cache_layout = [](const ggml_tensor * t) {
+@@ -9330,11 +9332,12 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
+ 
+     const float * params = (const float *) dst->op_params;
+ 
+-    if (q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
++    if (q->type != GGML_TYPE_F32 || q->ne[0] != 128 || n_tok < 1 || q->ne[3] != 1 || q->nb[0] != sizeof(float) ||
+             !cache_layout(k) || !cache_layout(v) || v->ne[1] != n_kv || v->ne[2] != n_head_kv ||
+-            r < 1 || r > 4 || r*n_head_kv != n_head_q || n_kv < min_kv ||
+-            mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] != 1 || mask->ne[3] != 1 ||
+-            (mask->ne[2] != 1 && (mask->ne[2] != n_head_q || mask->nb[2] != (size_t) n_kv*sizeof(ggml_fp16_t))) ||
++            r < 1 || n_tok*r > 8 || r*n_head_kv != n_head_q || n_kv < min_kv ||
++            mask->type != GGML_TYPE_F16 || mask->ne[0] != n_kv || mask->ne[1] != n_tok || mask->ne[3] != 1 ||
++            (mask->ne[2] != 1 && mask->ne[2] != n_head_q) || mask->nb[0] != sizeof(ggml_fp16_t) ||
++            dst->nb[1] != dst->ne[0]*sizeof(float) || dst->nb[2] != dst->nb[1]*dst->ne[1] ||
+             (sinks && (sinks->type != GGML_TYPE_F32 || sinks->ne[1] != 1)) ||
+             dst->src[5] != nullptr || dst->src[6] != nullptr || params[1] != 0.0f || params[2] != 0.0f) {
+         return false;
+@@ -9346,11 +9349,15 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
+     const uint32_t n_wg_s   = (uint32_t) CEIL_DIV(n_kv, keys);
+     const uint32_t n_wg_v   = (uint32_t) CEIL_DIV(n_kv, 256);
+     const uint32_t s_stride = n_wg_s*keys;
+-    const uint32_t off_mx   = (uint32_t) n_head_q*s_stride;
+-    const uint32_t off_mg   = off_mx + (uint32_t) n_head_q*n_wg_s;
+-    const uint32_t off_q    = off_mg + (uint32_t) n_head_q;
+-    const uint32_t off_p    = off_q + (uint32_t) n_head_q*40;
+-    const uint64_t temp_sz  = ((uint64_t) off_p + (uint64_t) n_head_q*n_wg_v*129)*sizeof(float);
++    const uint32_t off_mx   = (uint32_t) n_q*s_stride;
++    const uint32_t off_mg   = off_mx + (uint32_t) n_q*n_wg_s;
++    const uint32_t off_q    = off_mg + (uint32_t) n_q;
++    const uint32_t off_p    = off_q + (uint32_t) n_q*40;
++    const uint64_t temp_sz  = ((uint64_t) off_p + (uint64_t) n_q*n_wg_v*129)*sizeof(float);
++
++    if ((uint64_t) n_q*s_stride > UINT32_MAX/2) {
++        return false;
++    }
+ 
+     if (temp_sz > ctx->device->properties.limits.maxStorageBufferRange) {
+         return false;
+@@ -9377,27 +9384,30 @@ static bool ggml_vk_flash_attn_q4_decode(ggml_backend_vk_context * ctx, vk_conte
+     const vk_subbuffer t_buf = { ctx->prealloc_x, 0, temp_sz };
+ 
+     // each phase reads what the one before wrote to the scratch
+-    const vk_fa_q4_query_push_constants pcq = { (uint32_t) (q->nb[2]/sizeof(float)), (uint32_t) (get_misalign_bytes(ctx, q)/sizeof(float)), off_q };
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[0], { q_buf, t_buf }, pcq, { 1, (uint32_t) n_head_q, 1 });
++    const vk_fa_q4_query_push_constants pcq = {
++        (uint32_t) (q->nb[1]/sizeof(float)), (uint32_t) (q->nb[2]/sizeof(float)), (uint32_t) (get_misalign_bytes(ctx, q)/sizeof(float)), off_q, (uint32_t) n_head_q,
++    };
++    ggml_vk_dispatch_pipeline(ctx, subctx, pl[0], { q_buf, t_buf }, pcq, { 1, (uint32_t) n_q, 1 });
+     ggml_vk_sync_buffers(ctx, subctx);
+ 
+     const vk_fa_q4_scores_push_constants pc0 = {
+         (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) mask->ne[2],
++        (uint32_t) (mask->nb[1]/sizeof(ggml_fp16_t)), (uint32_t) (mask->nb[2]/sizeof(ggml_fp16_t)), (uint32_t) n_tok, (uint32_t) n_head_q,
+         (uint32_t) (get_misalign_bytes(ctx, mask)/sizeof(ggml_fp16_t)), s_stride, n_wg_s, off_mx, off_q, params[0],
+     };
+     ggml_vk_dispatch_pipeline(ctx, subctx, pl[1], { k_buf, m_buf, t_buf }, pc0, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
+     ggml_vk_sync_buffers(ctx, subctx);
+ 
+     const vk_fa_q4_max_push_constants pc1 = { n_wg_s, off_mx, off_mg };
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[2], { t_buf }, pc1, { 1, (uint32_t) n_head_q, 1 });
++    ggml_vk_dispatch_pipeline(ctx, subctx, pl[2], { t_buf }, pc1, { 1, (uint32_t) n_q, 1 });
+     ggml_vk_sync_buffers(ctx, subctx);
+ 
+-    const vk_fa_q4_values_push_constants pc2 = { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, s_stride, n_wg_v, off_mg, off_p, thr };
++    const vk_fa_q4_values_push_constants pc2 = { (uint32_t) n_kv, (uint32_t) n_head_kv, (uint32_t) r, (uint32_t) n_tok, (uint32_t) n_head_q, s_stride, n_wg_v, off_mg, off_p, thr };
+     ggml_vk_dispatch_pipeline(ctx, subctx, pl[3], { v_buf, t_buf }, pc2, { (uint32_t) n_kv, (uint32_t) n_head_kv, 1 });
+     ggml_vk_sync_buffers(ctx, subctx);
+ 
+-    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)), sinks ? 1u : 0u };
+-    ggml_vk_dispatch_pipeline(ctx, subctx, pl[4], { t_buf, sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, true) : t_buf, d_buf }, pc3, { 1, (uint32_t) n_head_q, 1 });
++    const vk_fa_q4_reduce_push_constants pc3 = { n_wg_v, off_mg, off_p, (uint32_t) (get_misalign_bytes(ctx, dst)/sizeof(float)), sinks ? 1u : 0u, (uint32_t) n_head_q };
++    ggml_vk_dispatch_pipeline(ctx, subctx, pl[4], { t_buf, sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, true) : t_buf, d_buf }, pc3, { 1, (uint32_t) n_q, 1 });
+ 
+     ctx->prealloc_x_need_sync = true;
+     return true;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_max.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_max.comp
+index df808da3c..f01fb34f4 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_max.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_max.comp
+@@ -3,8 +3,8 @@
+ #extension GL_KHR_shader_subgroup_basic : require
+ #extension GL_KHR_shader_subgroup_arithmetic : require
+ 
+-// Flash attention over a long Q4_0 cache, phase 2 of 4: the largest score of each query head, from the
+-// per-block maxima of phase 1. One workgroup per query head.
++// Flash attention over a long Q4_0 cache: the largest score of each query, from the
++// per-block maxima of the scores. One workgroup per token and query head.
+ 
+ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_query.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_query.comp
+index 43a9193bc..c8d609be7 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_query.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_query.comp
+@@ -5,7 +5,7 @@
+ 
+ // Flash attention over a long Q4_0 cache: the query of each head quantized to 8 bits, once.
+ // Per query head, 40 values in the scratch: 32 words of four packed bytes, the sum of the bytes of each
+-// block of 32 dims (the codes are value + 8), the scale, and 3 unused. One workgroup per query head.
++// block of 32 dims (the codes are value + 8), the scale, and 3 unused. One workgroup per token and query head.
+ 
+ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+ 
+@@ -13,9 +13,11 @@ const uint HS = 128;
+ 
+ layout(push_constant) uniform parameter
+ {
++    uint nbq1;       // elements between tokens
+     uint nbq2;       // elements between query heads
+     uint q_offset;
+     uint off_q;
++    uint n_head_q;
+ };
+ 
+ layout(binding = 0) readonly buffer Q  { float   data_q[]; };
+@@ -31,9 +33,9 @@ int q8(const float x, const float sc) {
+ 
+ void main() {
+     const uint tid = gl_LocalInvocationID.x;
+-    const uint hq  = gl_WorkGroupID.y;
++    const uint gq  = gl_WorkGroupID.y;   // token*n_head_q + head
+ 
+-    qf[tid] = data_q[q_offset + hq*nbq2 + tid];
++    qf[tid] = data_q[q_offset + (gq / n_head_q)*nbq1 + (gq % n_head_q)*nbq2 + tid];
+     barrier();
+     if (tid == 0) {
+         float mx = 1e-30;
+@@ -45,7 +47,7 @@ void main() {
+     barrier();
+ 
+     const float sc = qsc;
+-    const uint  qb = off_q + hq*40;
++    const uint  qb = off_q + gq*40;
+     if (tid < HS/4) {
+         const int a = q8(qf[4*tid], sc), b = q8(qf[4*tid + 1], sc), c = q8(qf[4*tid + 2], sc), d = q8(qf[4*tid + 3], sc);
+         data_ti[qb + tid] = int32_t((uint(a) & 0xFFu) | ((uint(b) & 0xFFu) << 8) | ((uint(c) & 0xFFu) << 16) | ((uint(d) & 0xFFu) << 24));
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_reduce.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_reduce.comp
+index f36fe103e..78987819c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_reduce.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_reduce.comp
+@@ -1,7 +1,7 @@
+ #version 450
+ 
+-// Flash attention over a long Q4_0 cache, phase 4 of 4: add the blocks up, the sink, and normalize.
+-// Workgroup = query head, thread = value dim.
++// Flash attention over a long Q4_0 cache: add the blocks up, the sink, and normalize.
++// Workgroup = (token, query head), thread = value dim.
+ 
+ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+ 
+@@ -14,6 +14,7 @@ layout(push_constant) uniform parameter
+     uint off_p;
+     uint d_offset;
+     uint has_sinks;
++    uint n_head_q;
+ };
+ 
+ layout(binding = 0) readonly  buffer T { float data_t[]; };
+@@ -22,17 +23,17 @@ layout(binding = 2) writeonly buffer D { float data_d[]; };
+ 
+ void main() {
+     const uint d  = gl_LocalInvocationID.x;
+-    const uint hq = gl_WorkGroupID.y;
++    const uint gq = gl_WorkGroupID.y;   // token*n_head_q + head
+ 
+     float acc = 0.0;
+     float l   = 0.0;
+-    const uint base = off_p + hq*n_wg*(HS + 1);
++    const uint base = off_p + gq*n_wg*(HS + 1);
+     for (uint i = 0; i < n_wg; ++i) {
+         acc += data_t[base + i*(HS + 1) + d];
+         l   += data_t[base + i*(HS + 1) + HS];
+     }
+     if (has_sinks != 0) {
+-        l += exp(data_s[hq] - data_t[off_mg + hq]);
++        l += exp(data_s[gq % n_head_q] - data_t[off_mg + gq]);
+     }
+-    data_d[d_offset + hq*HS + d] = l > 0.0 ? acc/l : 0.0;
++    data_d[d_offset + gq*HS + d] = l > 0.0 ? acc/l : 0.0;
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_scores.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_scores.comp
+index 6016ce2d0..8f22f2ec6 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_scores.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_scores.comp
+@@ -10,15 +10,15 @@
+ // Flash attention for one query token over a long Q4_0 cache: the scores.
+ // The cache codes are integers, so a key's dot product with a query quantized to 8 bits (fa_q4_query.comp)
+ // is four multiply-adds per instruction; the 4-bit keys carry 16 times the rounding error the query adds.
+-// Workgroup (block of KEYS keys, KV head): thread (key lane, query head) keeps its head's 32 query words
++// Workgroup (block of KEYS keys, KV head): thread (key lane, query slot) keeps its query's 32 words
+ // and walks its keys, so nothing goes through shared memory until the block maximum at the end.
+ 
+ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+ 
+-const uint MAX_R = 4;      // query heads per KV head
++const uint MAX_Q = 8;      // query slots of a KV head: tokens x query heads per KV head
+ const uint HS    = 128;
+ const uint NB    = HS/32;
+-const uint LANES = 256/MAX_R;
++const uint LANES = 256/MAX_Q;
+ const float NEG  = -3.0e38;
+ 
+ layout(constant_id = 0) const uint KEYS = 1024;   // keys per workgroup, a multiple of LANES
+@@ -29,6 +29,10 @@ layout(push_constant) uniform parameter
+     uint n_head_kv;
+     uint r;
+     uint nem2;
++    uint nbm1;       // mask strides, elements
++    uint nbm2;
++    uint n_tok;
++    uint n_head_q;
+     uint m_offset;
+     uint s_stride;   // scores per head (n_kv padded to KEYS)
+     uint n_wg;
+@@ -53,15 +57,17 @@ void main() {
+     const uint tid  = gl_LocalInvocationID.x;
+     const uint wg   = gl_WorkGroupID.x;
+     const uint hk   = gl_WorkGroupID.y;
+-    const uint h    = tid % MAX_R;
+-    const uint lane = tid / MAX_R;
+-    const uint hq   = hk*r + h;
++    const uint slot = tid % MAX_Q;
++    const uint lane = tid / MAX_Q;
++    const uint t    = slot / r;
++    const uint hq   = hk*r + slot % r;
++    const uint gq   = t*n_head_q + hq;
+ 
+     float mx = NEG;
+ 
+-    if (h < r) {
++    if (slot < n_tok*r) {
+         // words 8b..8b+3 pair with the low nibbles of block b (its dims 0..15), 8b+4..8b+7 with the high ones
+-        const uint qb = off_q + hq*40;
++        const uint qb = off_q + gq*40;
+         int32_t qw[32];
+         [[unroll]] for (uint j = 0; j < 32; ++j) {
+             qw[j] = data_ti[qb + j];
+@@ -71,12 +77,12 @@ void main() {
+             qsum[b] = data_t[qb + 32 + b];
+         }
+         const float qsc  = data_t[qb + 36]*scale;
+-        const uint  mrow = m_offset + (hq % nem2)*n_kv;
++        const uint  mrow = m_offset + t*nbm1 + (hq % nem2)*nbm2;
+ 
+         for (uint it = 0; it < KEYS/LANES; ++it) {
+             const uint key = wg*KEYS + lane + LANES*it;
+             if (key >= n_kv) {
+-                data_t[hq*s_stride + key] = NEG;
++                data_t[gq*s_stride + key] = NEG;
+                 continue;
+             }
+             const uint ib0 = (key*n_head_kv + hk)*NB;
+@@ -93,18 +99,18 @@ void main() {
+                 s += float(data_k[ib].d)*(float(acc) - 8.0*qsum[b]);
+             }
+             s = s*qsc + float(data_m[mrow + key]);
+-            data_t[hq*s_stride + key] = s;
++            data_t[gq*s_stride + key] = s;
+             mx = max(mx, s);
+         }
+     }
+ 
+     red[tid] = mx;
+     barrier();
+-    if (tid < r) {
++    if (tid < n_tok*r) {
+         float m = NEG;
+-        for (uint i = tid; i < 256; i += MAX_R) {
++        for (uint i = tid; i < 256; i += MAX_Q) {
+             m = max(m, red[i]);
+         }
+-        data_t[off_mx + (hk*r + tid)*n_wg + wg] = m;
++        data_t[off_mx + ((tid / r)*n_head_q + hk*r + tid % r)*n_wg + wg] = m;
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_values.comp b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_values.comp
+index eac69d2ca..b4b76691e 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_values.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/fa_q4_values.comp
+@@ -8,23 +8,29 @@
+ #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+ 
+ // Flash attention over a long Q4_0 cache: the weighted values of one block of 256 keys.
+-// Workgroup (key block, KV head). The weights exp(score - max) of the block go to shared memory first; a key
+-// whose weight is below thr for every query head is skipped without reading its values.
++// Workgroup (key block, KV head), for the query slots of the KV head (slot = token*r + head).
++// The weights exp(score - max) of the block go to shared memory first; a key whose weight is below thr for
++// every slot is skipped without reading its values (with two streams in one cache, that is every key of the
++// other stream).
+ // Thread (g, lane): g picks one 32-bit word of codes (8 dims: 4 low nibbles, 4 high ones) of one block of 32
+-// dims, lane 16 of the keys. The codes are value + 8 and a block has one scale d, so per key and head the
++// dims, lane 32 of the keys. The codes are value + 8 and a block has one scale d, so per key and slot the
+ // thread adds (w*d)*code for its 8 dims and keeps sum(w*d) once for the offset.
+ 
+-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+ 
+-const uint MAX_R = 4;
++const uint MAX_Q = 8;
+ const uint HS    = 128;
+ const uint NB    = HS/32;
++const uint LANES = 8;
++const uint KEYS  = 256;
+ 
+ layout(push_constant) uniform parameter
+ {
+     uint n_kv;
+     uint n_head_kv;
+     uint r;
++    uint n_tok;
++    uint n_head_q;
+     uint s_stride;
+     uint n_wg;
+     uint off_mg;
+@@ -40,39 +46,46 @@ struct block_q4 {
+ layout(binding = 0) readonly buffer V { block_q4 data_v[]; };
+ layout(binding = 1)          buffer T { float    data_t[]; };
+ 
+-shared float w[MAX_R][256];
+-shared float wmax[256];
+-shared vec4  part[16][MAX_R][16][2];   // [lane][head][g][low, high]
++shared float w[MAX_Q][KEYS];
++shared float wmax[KEYS];
++shared vec4  part[LANES][MAX_Q][16][2];   // [lane][slot][g][low, high]
++
++// the query of a slot of this KV head: token*n_head_q + head
++uint query(const uint hk, const uint slot) {
++    return (slot / r)*n_head_q + hk*r + slot % r;
++}
+ 
+ void main() {
+-    const uint tid = gl_LocalInvocationID.x;
+-    const uint wg  = gl_WorkGroupID.x;
+-    const uint hk  = gl_WorkGroupID.y;
++    const uint tid    = gl_LocalInvocationID.x;
++    const uint wg     = gl_WorkGroupID.x;
++    const uint hk     = gl_WorkGroupID.y;
++    const uint n_slot = n_tok*r;
+ 
+-    {
+-        const uint key = wg*256 + tid;
++    [[unroll]] for (uint it = 0; it < KEYS/128; ++it) {
++        const uint kl  = tid + 128*it;
++        const uint key = wg*KEYS + kl;
+         float m = 0.0;
+-        [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
++        [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
+             float x = 0.0;
+-            if (h < r && key < n_kv) {
+-                const uint hq = hk*r + h;
+-                x = exp(data_t[hq*s_stride + key] - data_t[off_mg + hq]);
++            if (s < n_slot && key < n_kv) {
++                const uint gq = query(hk, s);
++                x = exp(data_t[gq*s_stride + key] - data_t[off_mg + gq]);
+                 x = x < thr ? 0.0 : x;
+             }
+-            w[h][tid] = x;
++            w[s][kl] = x;
+             m = max(m, x);
+         }
+-        wmax[tid] = m;
++        wmax[kl] = m;
+     }
+     barrier();
+ 
+-    // the sum of the weights of each head rides after its HS values
+-    if (tid < r) {
++    // the sum of the weights of each query rides after its HS values
++    if (tid < n_slot) {
+         float l = 0.0;
+-        for (uint i = 0; i < 256; ++i) {
++        for (uint i = 0; i < KEYS; ++i) {
+             l += w[tid][i];
+         }
+-        data_t[off_p + ((hk*r + tid)*n_wg + wg)*(HS + 1) + HS] = l;
++        data_t[off_p + (query(hk, tid)*n_wg + wg)*(HS + 1) + HS] = l;
+     }
+ 
+     const uint g    = tid % 16;
+@@ -80,47 +93,49 @@ void main() {
+     const uint b    = g / 4;
+     const uint j    = g % 4;
+ 
+-    vec4  lo[MAX_R];
+-    vec4  hi[MAX_R];
+-    float off[MAX_R];
+-    [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
+-        lo[h]  = vec4(0.0);
+-        hi[h]  = vec4(0.0);
+-        off[h] = 0.0;
++    vec4  lo[MAX_Q];
++    vec4  hi[MAX_Q];
++    float off[MAX_Q];
++    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
++        lo[s]  = vec4(0.0);
++        hi[s]  = vec4(0.0);
++        off[s] = 0.0;
+     }
+ 
+-    [[unroll]] for (uint i = 0; i < 16; ++i) {
+-        const uint kl = lane*16 + i;
++    for (uint i = 0; i < KEYS/LANES; ++i) {
++        const uint kl = lane*(KEYS/LANES) + i;
+         if (wmax[kl] != 0.0) {
+-            const uint  ib = ((wg*256 + kl)*n_head_kv + hk)*NB + b;
++            const uint  ib = ((wg*KEYS + kl)*n_head_kv + hk)*NB + b;
+             const float d  = float(data_v[ib].d);
+             const uint  c  = uint(data_v[ib].qs[2*j]) | (uint(data_v[ib].qs[2*j + 1]) << 16);
+             const vec4  cl = vec4(unpack8(c & 0x0F0F0F0Fu));
+             const vec4  ch = vec4(unpack8((c >> 4) & 0x0F0F0F0Fu));
+-            [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
+-                const float wd = w[h][kl]*d;
+-                lo[h]  += wd*cl;
+-                hi[h]  += wd*ch;
+-                off[h] += wd;
++            [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
++                if (s < n_slot) {
++                    const float wd = w[s][kl]*d;
++                    lo[s]  += wd*cl;
++                    hi[s]  += wd*ch;
++                    off[s] += wd;
++                }
+             }
+         }
+     }
+-    [[unroll]] for (uint h = 0; h < MAX_R; ++h) {
+-        part[lane][h][g][0] = lo[h] - 8.0*off[h];
+-        part[lane][h][g][1] = hi[h] - 8.0*off[h];
++    [[unroll]] for (uint s = 0; s < MAX_Q; ++s) {
++        part[lane][s][g][0] = lo[s] - 8.0*off[s];
++        part[lane][s][g][1] = hi[s] - 8.0*off[s];
+     }
+     barrier();
+ 
+-    // thread (g, head): add the 16 lanes and write the 8 dims of the word
+-    if (lane < r) {
+-        const uint h = lane;
++    // thread (g, slot): add the lanes and write the 8 dims of the word
++    if (lane < n_slot) {
++        const uint s = lane;
+         vec4 sl = vec4(0.0);
+         vec4 sh = vec4(0.0);
+-        [[unroll]] for (uint i = 0; i < 16; ++i) {
+-            sl += part[i][h][g][0];
+-            sh += part[i][h][g][1];
++        [[unroll]] for (uint i = 0; i < LANES; ++i) {
++            sl += part[i][s][g][0];
++            sh += part[i][s][g][1];
+         }
+-        const uint base = off_p + ((hk*r + h)*n_wg + wg)*(HS + 1) + b*32 + 4*j;
++        const uint base = off_p + (query(hk, s)*n_wg + wg)*(HS + 1) + b*32 + 4*j;
+         [[unroll]] for (uint e = 0; e < 4; ++e) {
+             data_t[base + e]      = sl[e];
+             data_t[base + 16 + e] = sh[e];
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b65b4a5e4..8b3743212 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11144,11 +11144,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
+     }
+ 
+-    // one query token over a long Q4_0 cache in the cache layout (permuted view), with and without a mask per query head
++    // a decode step over a long Q4_0 cache in the cache layout (permuted view), with and without a mask per query head
+     for (int64_t kv : {8192, 20000}) {
+         for (int64_t mh : {1, 24}) {
+             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
+                                                             {0, 2, 1, 3}, false, false, 0, 0, mh));
++            // two streams decoding together, with sinks
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 2, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
++                                                            {0, 2, 1, 3}, false, false, 0, 0, mh));
+         }
+     }
+     test_cases.emplace_back(new test_flash_attn_rel(2560, 64, 1024, GGML_TYPE_F16, true));
+-- 
+2.52.0.windows.1
+

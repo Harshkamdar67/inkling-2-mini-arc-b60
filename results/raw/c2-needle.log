@@ -1,0 +1,6 @@
+=== c2-needle: 2 streams x 100000 tokens, pool 262144 01:17:19
+{"n_target": 100000, "prompt_tokens": 99220, "seed": 21, "found": 5, "of": 5, "hits": {"Heron@5%": true, "Saffron@25%": true, "Basalt@50%": true, "Juniper@75%": true, "Cobalt@95%": true}, "prompt_tps": 732.2382718096362, "decode_t
+{"n_target": 100000, "prompt_tokens": 99220, "seed": 22, "found": 5, "of": 5, "hits": {"Heron@5%": true, "Saffron@25%": true, "Basalt@50%": true, "Juniper@75%": true, "Cobalt@95%": true}, "prompt_tps": 680.1714775225436, "decode_t
+luid_0x00000000_0x00010e 10,414 MB
+luid_0x00000000_0x00011f 19,224 MB
+=== c2-needle done 01:22:10

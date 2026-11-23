@@ -1,0 +1,30 @@
+From 821b1457897f1849f54e05ff5d26d0bb4db6b235 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sat, 21 Nov 2026 11:28:18 +0530
+Subject: [PATCH 04/32] dspark: apply the fuse softmax to the whole weight
+ before taking row views
+
+A row view starts at row*ntarget floats; Vulkan's soft_max asserts on misaligned sources.
+---
+ src/models/dspark.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+index 6b0df9a98..1df0843db 100644
+--- a/src/models/dspark.cpp
++++ b/src/models/dspark.cpp
+@@ -980,8 +980,10 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
+     auto * attn = build_attn_inp_kv_iswa();
+     const int64_t rank = model.dspark_markov_w1->ne[0];
+     const int64_t ntarget = model.target_layer_ids.size();
++    // softmax every row once: a row view starts at row*ntarget floats, which backends that need aligned inputs reject
++    auto * fuse = ggml_soft_max(ctx0, model.dspark_fuse);
+     const auto mix = [&](ggml_tensor * features, int row, ggml_tensor * norm) {
+-        auto * weights = ggml_soft_max(ctx0, ggml_view_1d(ctx0, model.dspark_fuse, ntarget, row*model.dspark_fuse->nb[1]));
++        auto * weights = ggml_cont(ctx0, ggml_view_1d(ctx0, fuse, ntarget, row*fuse->nb[1]));
+         auto * x = ggml_reshape_3d(ctx0, features, n_embd, ntarget, n_tokens);
+         x = ggml_cont(ctx0, ggml_permute(ctx0, x, 1, 0, 2, 3));
+         x = ggml_sum_rows(ctx0, ggml_mul(ctx0, x, weights));
+-- 
+2.52.0.windows.1
+

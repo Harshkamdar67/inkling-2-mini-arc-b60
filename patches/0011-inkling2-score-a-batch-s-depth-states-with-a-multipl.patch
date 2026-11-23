@@ -1,0 +1,34 @@
+From 938c703028f9e2b0ecd235b8a5e83cdd72a7bf6b Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sat, 21 Nov 2026 23:44:37 +0530
+Subject: [PATCH 11/32] inkling2: score a batch's depth states with a multiply
+ and row sum
+
+The broadcast single-query product took a slow mat-vec path once there was more than one
+token (46 us per call on the B60). Two and four token steps 54.1 -> 56.4 and 77.8 -> 82.3 tok/s.
+---
+ src/models/inkling2.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 99b2de394..d522ef527 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -199,9 +199,13 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+     states = ggml_rms_norm(ctx0, states, 1e-6f);
+ 
+     ggml_tensor * scores;
+-    if (query->ne[1] == 1) {
++    if (query->ne[1] == 1 && n_tokens == 1) {
+         // one query: broadcast it over the tokens, and [1, n_states, n_tokens] has the layout of [n_states, 1, n_tokens]
+         scores = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, query, states), states->ne[1], 1, n_tokens);
++    } else if (query->ne[1] == 1) {
++        // several tokens: the broadcast product takes a slow mat-vec path, a multiply and a row sum do not
++        scores = ggml_sum_rows(ctx0, ggml_mul(ctx0, states, query));
++        scores = ggml_reshape_3d(ctx0, scores, states->ne[1], 1, n_tokens);
+     } else {
+         ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+         scores = ggml_mul_mat(ctx0, states, queries);
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,221 @@
+From fa43473183dc6d3fb8b107272a4f4073367830b0 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 22:51:11 +0530
+Subject: [PATCH 30/32] vulkan: the Xe prefill attention kernel reads a Q4_0
+ cache directly
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  5 +-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 18 +++++-
+ .../vulkan-shaders/flash_attn_prefill.comp    | 56 ++++++++++++++++++-
+ tests/test-backend-ops.cpp                    |  9 +++
+ 4 files changed, 82 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 3726047ee..2c105d2b1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -465,10 +465,11 @@ struct vk_xe_fa_pipeline_state {
+     bool unaligned_q;
+     bool partial_row_mask;
+     bool multi_head_mask;
++    bool kv_q4 = false;   // prefill: K and V are Q4_0 in the cache layout and the kernel decodes them itself
+ 
+     bool operator<(const vk_xe_fa_pipeline_state &b) const {
+-        return std::tie(HSK, HSV, qk_ratio, pv_ratio, decode_n, unaligned_seq_len, unaligned_q, partial_row_mask, multi_head_mask) <
+-               std::tie(b.HSK, b.HSV, b.qk_ratio, b.pv_ratio, b.decode_n, b.unaligned_seq_len, b.unaligned_q, b.partial_row_mask, b.multi_head_mask);
++        return std::tie(HSK, HSV, qk_ratio, pv_ratio, decode_n, unaligned_seq_len, unaligned_q, partial_row_mask, multi_head_mask, kv_q4) <
++               std::tie(b.HSK, b.HSV, b.qk_ratio, b.pv_ratio, b.decode_n, b.unaligned_seq_len, b.unaligned_q, b.partial_row_mask, b.multi_head_mask, b.kv_q4);
+     }
+ };
+ 
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 30fa4c82a..5b97a119d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1574,6 +1574,10 @@ static vk_xe_fa_tuning_params get_xe_fa_tuning_params(const vk_device_struct * d
+             pipeline_flag |= 1 << 3;
+         }
+ 
++        if (pipeline_state.kv_q4) {
++            pipeline_flag |= 1 << 4;
++        }
++
+         params.workgroup_size = { wg_sz };
+         params.subgroup_size = { sg_sz };
+         params.shmem_sz = shmem_sz;
+@@ -9513,7 +9517,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     const uint32_t cm2_min_reuse = KV >= 8192 ? 4096 : 8192;
+     // Query reuse must cover the conversion and synchronization cost.
+     const bool cm2_dequant_kv = KV >= 4096 && neq1 >= cm2_min_queries && (uint64_t) neq1 * qk_ratio >= cm2_min_reuse;
+-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
++    // Q4_0 K and V in the cache layout on Xe2: the prefill kernel decodes the codes as it stages them, so there is no
++    // conversion of the whole cache to F16 before every call (4 ms of 19 at 65K keys) and no scratch of 4 KB a key
++    const bool xe_q4_direct = ctx->device->xe_fa_support && ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
++                              ctx->device->architecture == vk_device_architecture::INTEL_XE2 && neq1 > 8 &&
++                              k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 && HSK == 128 && HSV == 128 &&
++                              is_dense_kv_cache(k) && is_dense_kv_cache(v) && nek3 == 1 && nev3 == 1 &&
++                              !getenv("GGML_VK_XE_FA_NO_Q4_DIRECT");
++    const bool use_dequant_kv = !xe_q4_direct && ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
+                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
+                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
+@@ -9646,11 +9657,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     // quantized K/V of a large batch were converted above into a dense f16 scratch ([head][token][dim]), which the prefill kernel can read
+     const bool xe_fa_dequant_kv = use_dequant_kv && !kv_raw_strided && neq1 > 8 && !getenv("GGML_VK_XE_FA_NO_DEQUANT_PREFILL");
+     bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && mask != nullptr && !use_sparse && max_bias == 0.0f && logit_softcap == 0.0f &&
+-                                 (xe_fa_dequant_kv || (tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u)));
++                                 (xe_fa_dequant_kv || xe_q4_direct || (tensor_aligned_with(k, 16u) && tensor_aligned_with(v, 16u)));
+     // q8_0/q4_0 K/V: only the dual-phase decode kernel reads them (dequantizing inline); larger batches keep the generic path
+     const bool xe_fa_kv_quant = (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0) && v->type == k->type &&
+                                 neq1 <= 8 && neq2 / nev2 <= 64 && neq0 % 32 == 0 && nev0 % 32 == 0 && !getenv("GGML_VK_XE_FA_NO_QUANT_KV");
+-    bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && ((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || xe_fa_kv_quant || xe_fa_dequant_kv) &&
++    bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && ((k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) || xe_fa_kv_quant || xe_fa_dequant_kv || xe_q4_direct) &&
+                                  mask != nullptr && mask->type == GGML_TYPE_F16;
+     xe_fa_opt = xe_fa_supported_platform && xe_fa_supported_usage && xe_fa_supported_dtype;
+     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
+@@ -9673,6 +9684,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+                 prefill_state.unaligned_q = head_stride_q % 8 != 0 || q_stride % 8 != 0 || batch_stride_q % 8 != 0;
+                 prefill_state.partial_row_mask = neq1 > nem1;
+                 prefill_state.multi_head_mask = nem2 > 1;
++                prefill_state.kv_q4 = xe_q4_direct;
+                 xe_fa_params = get_xe_fa_tuning_params(vk_dev, prefill_state, true);
+                 if (xe_fa_params.shmem_sz <= vk_dev->properties.limits.maxComputeSharedMemorySize) {
+                     auto& xe_fa_pipelines = ctx->device->pipeline_xe_fa_prefill;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp
+index 2c9345f53..1f46c0ada 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_prefill.comp
+@@ -1,5 +1,7 @@
+ #version 450
+ 
++#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+ #extension GL_EXT_control_flow_attributes : enable
+ #extension GL_EXT_shader_16bit_storage : require
+ #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+@@ -24,6 +26,13 @@ layout (binding = 3) readonly buffer MV2 {f16vec2 data_mv2[];};
+ layout (binding = 3) readonly buffer MV4 {f16vec4 data_mv4[];};
+ layout (binding = 4) readonly buffer S {float data_s[];};
+ layout (binding = 5) buffer OV4 {vec4 data_ov4[];};
++// Q4_0 K and V in the cache layout ([head_dim][head][key] blocks), read as codes (KV_Q4_BIT)
++struct block_q4 {
++    float16_t d;
++    uint16_t  qs[8];
++};
++layout (binding = 1) readonly buffer KQ4 {block_q4 data_kq4[];};
++layout (binding = 2) readonly buffer VQ4 {block_q4 data_vq4[];};
+ // relative-position bias [rel_dist, n_head_q, n_tokens], read where the mask holds 1 + distance (REL_BIAS_BIT)
+ layout (binding = 6) readonly buffer RB {float data_rb[];};
+ 
+@@ -75,12 +84,14 @@ layout (constant_id = 14) const uint gqa_fold = 1;
+ #define UNALIGNED_Q_STRIDE_BIT (1 << 1)
+ #define PARTIAL_ROW_MASK_BIT (1 << 2)
+ #define INTEL_GPU_BIT (1 << 3)
++#define KV_Q4_BIT (1 << 4)
+ #define SINK_ENABLE_BIT (1 << 16)
+ #define REL_BIAS_BIT (1 << 17)
+ #define SINK_PER_ROW_BIT (1 << 18)
+ 
+ const bool aligned_q_stride = (Flags & UNALIGNED_Q_STRIDE_BIT) == 0;
+ const bool seq_boundary_check = (Flags & UNALIGNED_SEQ_LEN_BIT) != 0;
++const bool kv_q4 = (Flags & KV_Q4_BIT) != 0;
+ const bool partial_row_mask = (Flags & PARTIAL_ROW_MASK_BIT) != 0;
+ const uint TK = 16;
+ const uint sg_count = WorkGroupSize / SubGroupSize;
+@@ -157,6 +168,24 @@ shared shf16m2x4_alias {
+     f16mat2x4 M2x4sh[shmem_size / 16];
+ } F16M2x4Poolsh;
+ 
++// 8 consecutive dims (chunk c of a head's dims) of one key of a Q4_0 cache, as the kernel stages them in F16.
++// A block is 32 dims: its first 16 are the low nibbles of the 16 code bytes, the next 16 the high nibbles.
++#define Q4_CHUNK(NAME, DATA) \
++f16mat2x4 NAME(const uint key, const uint head, const uint n_head, const uint c) { \
++    const uint  ib   = (key * n_head + head) * (HSK / 32) + c / 4; \
++    const uint  part = c % 4; \
++    const uint  w    = (part & 1u) * 4; \
++    const uint  sh   = part >= 2 ? 4u : 0u; \
++    const float d    = float(DATA[ib].d); \
++    const uint  w0   = uint(DATA[ib].qs[w]) | (uint(DATA[ib].qs[w + 1]) << 16); \
++    const uint  w1   = uint(DATA[ib].qs[w + 2]) | (uint(DATA[ib].qs[w + 3]) << 16); \
++    const vec4  a    = (vec4(unpack8((w0 >> sh) & 0x0F0F0F0Fu)) - 8.0f) * d; \
++    const vec4  b    = (vec4(unpack8((w1 >> sh) & 0x0F0F0F0Fu)) - 8.0f) * d; \
++    return f16mat2x4(f16vec4(a), f16vec4(b)); \
++}
++Q4_CHUNK(q4_chunk_k, data_kq4)
++Q4_CHUNK(q4_chunk_v, data_vq4)
++
+ void main() {
+     const uint lane = gl_SubgroupInvocationID;
+     const uint lane_c = lane % TN;
+@@ -367,6 +396,10 @@ void main() {
+                     if (mask_load_k[idx]) {
+                         if (k_col == 4) {
+                             F16V4Poolsh.F16V4sh[ksh_offset[idx]] = data_kv4[k_offset[idx]];
++                        } else if (kv_q4) {
++                            const uint kpos = idx * WorkGroupSize + sg * SubGroupSize + lane;
++                            F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] =
++                                q4_chunk_k(min(loop * step_p + kpos / (HSK / k_col), p.nek1 - 1), head_k_idx, p.nek2, kpos % (HSK / k_col));
+                         } else {
+                             F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] = data_km2x4[k_offset[idx]];
+                         }
+@@ -381,6 +414,10 @@ void main() {
+ 
+                     if (k_col == 4) {
+                         F16V4Poolsh.F16V4sh[ksh_offset[idx]] = data_kv4[k_offset[idx]];
++                    } else if (kv_q4) {
++                        const uint kpos = idx * WorkGroupSize + sg * SubGroupSize + lane;
++                        F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] =
++                            q4_chunk_k(min(loop * step_p + kpos / (HSK / k_col), p.nek1 - 1), head_k_idx, p.nek2, kpos % (HSK / k_col));
+                     } else {
+                         F16M2x4Poolsh.M2x4sh[ksh_offset[idx]] = data_km2x4[k_offset[idx]];
+                     }
+@@ -607,7 +644,24 @@ void main() {
+             Mf = Mnewf;
+         }
+ 
+-        if (v_in_shmem && (qk_sg == sg_count || sg >= sg_count - loadv_sg)) {
++        if (kv_q4 && v_in_shmem && (qk_sg == sg_count || sg >= sg_count - loadv_sg)) {
++            // one lane per key of the group (SubGroupSize == TK): its 8 dims of each row block, decoded in place
++            const uint v_key = loop * step_p + sg_v_c * TK + lane_c;
++            [[unroll]] for (uint r = 0; r < v_loops; ++r) {
++                const uint dim0 = TM * (sg_v_r + r * v_hori_groups);
++                if (dim0 < HSV) {
++                    f16mat2x4 vals = f16mat2x4(f16vec4(0.0f), f16vec4(0.0f));
++                    if (v_key < p.nek1) {
++                        vals = q4_chunk_v(v_key, head_v_idx, p.nev2, dim0 / 8);
++                    }
++                    const uint base = vsh_offset + TM * r * TK * v_hori_groups + lane_c;
++                    [[unroll]] for (uint i = 0; i < 4; ++i) {
++                        F16Poolsh.F16sh[base + i * TK]       = vals[0][i];
++                        F16Poolsh.F16sh[base + (4 + i) * TK] = vals[1][i];
++                    }
++                }
++            }
++        } else if (v_in_shmem && (qk_sg == sg_count || sg >= sg_count - loadv_sg)) {
+             if (seq_boundary_check && loop + 1 == loop_count) {
+                 const uint v_global_coord_base = loop * step_p + sg_v_c * TK + lane_c;
+                 if (v_boundary_check) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8b3743212..10d412fd7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11154,6 +11154,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                                                             {0, 2, 1, 3}, false, false, 0, 0, mh));
+         }
+     }
++    // batches over a Q4_0 cache in the cache layout (the Xe2 prefill kernel reads the codes directly)
++    for (int64_t kv : {2048, 5000}) {
++        for (int64_t nb : {64, 256, 300}) {
++            for (int64_t mh : {1, 24}) {
++                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,
++                                                                {0, 2, 1, 3}, false, false, 0, 0, mh));
++            }
++        }
++    }
+     test_cases.emplace_back(new test_flash_attn_rel(2560, 64, 1024, GGML_TYPE_F16, true));
+     test_cases.emplace_back(new test_flash_attn_rel(2560, 256, 1024, GGML_TYPE_F16, true));
+     test_cases.emplace_back(new test_flash_attn_rel(5000, 128, 1024, GGML_TYPE_F16, false));
+-- 
+2.52.0.windows.1
+

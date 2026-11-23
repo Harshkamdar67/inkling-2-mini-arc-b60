@@ -1,0 +1,26 @@
+From 10538e3659c94cf6ba2d848d4f69ad4da43a85bf Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sun, 22 Nov 2026 15:01:21 +0530
+Subject: [PATCH 21/32] vulkan: integer-dot IQ4_NL mat-vec from 1024 columns on
+ Xe2 with the Windows driver
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 2e6a6d1c5..58f863787 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -7566,7 +7566,7 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
+         }
+ 
+         if (device->architecture == vk_device_architecture::INTEL_XE2 && device->driver_id == vk::DriverId::eIntelProprietaryWindows &&
+-            k >= 2048 && src0_type == GGML_TYPE_IQ4_NL && !getenv("GGML_VK_XE2_OLD_MMVQ")) {
++            k >= 1024 && src0_type == GGML_TYPE_IQ4_NL && !getenv("GGML_VK_XE2_OLD_MMVQ")) {
+             return true;
+         }
+ 
+-- 
+2.52.0.windows.1
+

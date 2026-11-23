@@ -1,0 +1,159 @@
+From 8a560584fd2edc675a8b150378bd2d8d6040b616 Mon Sep 17 00:00:00 2001
+From: Harshkamdar67 <harshkamdar67@gmail.com>
+Date: Sat, 21 Nov 2026 11:28:17 +0530
+Subject: [PATCH 02/32] vulkan: accept non-contiguous SCALE input and add an
+ integer-dot mat-vec path for IQ4_NL
+
+SCALE required a contiguous source, so the SITU activation of Inkling 2 (a scale of a view
+of the fused gate/up output) ran on the CPU twice per layer visit: 194 graph splits.
+IQ4_NL had no MMVQ pipelines although IQ4_XS and MXFP4 do; on Xe2 with the Windows
+driver it is used at one token as well.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp              | 11 ++++++++++-
+ .../ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp  |  2 +-
+ .../vulkan-shaders/mul_mat_vecq_funcs.glsl        | 15 ++++++++++++++-
+ ggml/src/ggml-vulkan/vulkan-shaders/scale.comp    |  2 +-
+ .../vulkan-shaders/vulkan-shaders-gen.cpp         |  4 ++--
+ 5 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 454abbf46..d3fe1febd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3407,6 +3407,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_NL][i], "mul_mat_vec_iq4_nl_q8_1_f32", arr_dmmv_iq4_nl_q8_1_f32_len[reduc], arr_dmmv_iq4_nl_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_kq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_kq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+@@ -3464,6 +3465,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q8_0], "mul_mat_vec_id_q8_0_q8_1_f32", arr_dmmv_id_q8_0_q8_1_f32_len[reduc], arr_dmmv_id_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(1*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(1*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_MXFP4], "mul_mat_vec_id_mxfp4_q8_1_f32", arr_dmmv_id_mxfp4_q8_1_f32_len[reduc], arr_dmmv_id_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(2*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ4_NL], "mul_mat_vec_id_iq4_nl_q8_1_f32", arr_dmmv_id_iq4_nl_q8_1_f32_len[reduc], arr_dmmv_id_iq4_nl_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(2*rm_stdq_int), 1, 1}, {wg_size_subgroup_int, rm_id(2*rm_stdq_int)}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32", arr_dmmv_id_q2_k_q8_1_f32_len[reduc], arr_dmmv_id_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(2*rm_kq_int), 1, 1}, {wg_size_subgroup_int, rm_id(2*rm_kq_int)}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q3_K], "mul_mat_vec_id_q3_k_q8_1_f32", arr_dmmv_id_q3_k_q8_1_f32_len[reduc], arr_dmmv_id_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rm_id(1*rm_kq_int), 1, 1}, {wg_size_subgroup_int, rm_id(1*rm_kq_int)}, 1, true, use_subgroups, subgroup_size_int);
+@@ -6272,6 +6274,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+             case GGML_TYPE_IQ1_S:
+             case GGML_TYPE_IQ1_M:
+             case GGML_TYPE_IQ4_XS:
++            case GGML_TYPE_IQ4_NL:
+                 break;
+             default:
+                 return nullptr;
+@@ -6360,6 +6363,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+             case GGML_TYPE_IQ1_S:
+             case GGML_TYPE_IQ1_M:
+             case GGML_TYPE_IQ4_XS:
++            case GGML_TYPE_IQ4_NL:
+                 break;
+             default:
+                 return nullptr;
+@@ -7537,6 +7541,11 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
+             return true;
+         }
+ 
++        if (device->architecture == vk_device_architecture::INTEL_XE2 && device->driver_id == vk::DriverId::eIntelProprietaryWindows &&
++            k >= 2048 && src0_type == GGML_TYPE_IQ4_NL && !getenv("GGML_VK_XE2_OLD_MMVQ")) {
++            return true;
++        }
++
+         if (device->driver_id == vk::DriverId::eIntelProprietaryWindows) {
+             // Intel Windows proprietary driver MMVQ performance for !Q2/Q3/Q6 is worse than fp16,
+             // see https://github.com/ggml-org/llama.cpp/issues/17628 and
+@@ -17080,7 +17089,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+         case GGML_OP_SLEEP:
+             return device->shader_clock;
+         case GGML_OP_SCALE:
+-            return ggml_is_contiguous(op->src[0]) && ggml_vk_is_float_elementwise(op);
++            return ggml_vk_is_float_elementwise(op);
+         case GGML_OP_PAD:
+         case GGML_OP_PAD_REFLECT_1D:
+         case GGML_OP_ROLL:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index 51c64478a..b56bace84 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -14,7 +14,7 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+ #if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
+ #define K_PER_ITER 16
+-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
++#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_IQ4_NL)
+ #define K_PER_ITER 8
+ #elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ4_XS)
+ #define K_PER_ITER 32
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+index 03c348bf9..ecc53d9b4 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -157,6 +157,19 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
+ }
+ #endif
+ 
++#if defined(DATA_A_IQ4_NL)
++// 2-byte loads for iq4_nl blocks (18 bytes)
++i32vec2 repack(uint ib, uint iqs) {
++    const uint32_t vui = pack32(u16vec2(data_a_packed16[ib].qs[iqs * 2    ],
++                                        data_a_packed16[ib].qs[iqs * 2 + 1]));
++    return iq4nl_to_i8x8(vui);
++}
++
++FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
++    return FLOAT_TYPE(da * dsb.x * float(q_sum));
++}
++#endif
++
+ #if defined(DATA_A_Q2_0)
+ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+     int32_t q_sum = 0;
+@@ -169,7 +182,7 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+     // 16 quants per call => divide sums by 32/16 = 2
+     return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
+ }
+-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
++#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4) || defined(DATA_A_IQ4_NL)
+ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+     int32_t q_sum = 0;
+ #if QUANT_R == 2
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/scale.comp b/ggml/src/ggml-vulkan/vulkan-shaders/scale.comp
+index 83ee31a72..0313f2fed 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/scale.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/scale.comp
+@@ -18,7 +18,7 @@ void main() {
+             continue;
+         }
+ 
+-        data_d[get_doffset() + idx] = FLOAT_TO_D(A_TO_FLOAT(data_a[get_aoffset() + idx]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
++        data_d[get_doffset() + dst_idx(idx)] = FLOAT_TO_D(A_TO_FLOAT(data_a[get_aoffset() + src0_idx(idx)]) * FLOAT_TYPE(p.param1) + FLOAT_TYPE(p.param2));
+         idx += num_threads;
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index dbab31e91..b1f3179ed 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -825,7 +825,7 @@ void process_shaders() {
+ 
+         // mul mat vec with integer dot product
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs") {
++        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs" || tname == "iq4_nl") {
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+@@ -1329,7 +1329,7 @@ void write_output_files() {
+ 
+     for (const std::string& btype : btypes) {
+     for (const auto& tname : type_names) {
+-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs") {
++        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs" && tname != "iq4_nl") {
+             continue;
+         }
+         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";
+-- 
+2.52.0.windows.1
+
